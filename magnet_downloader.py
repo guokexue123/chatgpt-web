@@ -13,6 +13,9 @@ import re
 import time
 import threading
 import subprocess
+import urllib.request
+import urllib.error
+import warnings as _warnings
 import shutil
 import signal
 import argparse
@@ -249,6 +252,45 @@ def scan_videos(path: str) -> List[str]:
 
 
 # ──────────────────────────────────────────
+# Torrent 元数据预取（HTTP 方式，跳过 DHT 等待）
+# ──────────────────────────────────────────
+# 原理：这些公共网站会爬取/缓存已知 info_hash 对应的 .torrent 文件。
+# 如果命中缓存，可在 <1s 内拿到完整元数据，完全跳过漫长的 DHT 阶段。
+
+_TORRENT_FETCH_SOURCES = [
+    # 格式: (url_template, response类型)  {h} = 大写 hex hash
+    "https://itorrents.org/torrent/{h}.torrent",
+    "https://torrage.info/torrent.php?h={h}",
+    "https://torcache.net/torrent/{h}.torrent",
+]
+
+
+def fetch_torrent_bytes(info_hash: str, timeout: int = 8) -> Optional[bytes]:
+    """
+    用 info_hash 从公共 torrent 缓存站下载 .torrent 文件字节。
+    成功返回 bytes，失败返回 None（静默）。
+    """
+    h = info_hash.upper()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': '*/*',
+    }
+    for tpl in _TORRENT_FETCH_SOURCES:
+        url = tpl.format(h=h)
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+                if len(data) > 200 and data[:2] == b'd8':  # bencode dict
+                    return data
+                if len(data) > 200 and data[0:1] == b'd':  # bencode
+                    return data
+        except Exception:
+            continue
+    return None
+
+
+# ──────────────────────────────────────────
 # 下载核心
 # ──────────────────────────────────────────
 
@@ -268,10 +310,12 @@ class MagnetDownloader:
         self.upload_limit = self.cfg.upload_limit_kb * 1024
         self.dl_limit     = self.cfg.download_limit_kb * 1024
 
-        self._session:  Optional[lt.session]         = None
-        self._handle:   Optional[lt.torrent_handle]  = None
-        self._stop      = threading.Event()
-        self._previewed = False
+        self._session:          Optional[lt.session]         = None
+        self._handle:           Optional[lt.torrent_handle]  = None
+        self._stop              = threading.Event()
+        self._previewed         = False
+        self._meta_prefetched   = False   # HTTP 预取是否成功
+        self._dht_nodes         = 0       # 后台异步更新
 
     # ── 会话初始化 ──
 
@@ -358,29 +402,53 @@ class MagnetDownloader:
     ]
 
     def _add_torrent(self) -> lt.torrent_handle:
-        params = lt.parse_magnet_uri(self.info.raw)
+        params = lt.add_torrent_params()
         params.save_path    = self.save_path
         params.storage_mode = lt.storage_mode_t.storage_mode_sparse
 
-        # 注入公共 tracker（与磁力链自带 tracker 合并）
+        # ── 优先尝试 HTTP 预取 .torrent（可跳过 DHT 等待，秒级获取元数据）──
+        cprint(C.YELLOW, "尝试从公共缓存站预取种子元数据（可绕过 DHT 加速启动）...")
+        torrent_bytes = fetch_torrent_bytes(self.info.info_hash)
+        if torrent_bytes:
+            try:
+                ti = lt.torrent_info(torrent_bytes)
+                params.ti = ti
+                cprint(C.GREEN, f"  ✓ 预取成功！跳过 DHT 等待，直接使用缓存元数据。")
+                self._meta_prefetched = True
+            except Exception as e:
+                cprint(C.YELLOW, f"  预取的数据解析失败（{e}），回退到 DHT 模式。")
+                torrent_bytes = None
+
+        if not torrent_bytes:
+            # 回退：从磁力链解析参数
+            mp = lt.parse_magnet_uri(self.info.raw)
+            params.info_hashes = mp.info_hashes
+            params.trackers    = mp.trackers
+            params.name        = mp.name
+            self._meta_prefetched = False
+
+        # 注入公共 tracker（合并去重）
         existing = set(params.trackers)
         for t in self._PUBLIC_TRACKERS:
             if t not in existing:
                 params.trackers.append(t)
 
-        # 不预设顺序下载：peer 少时随机分片更容易凑齐数据；
-        # 待下载达到一定量后可手动开启顺序（有助于边下边播）
+        # 随机分片：peer 少时比顺序分片更容易凑够数据
         return self._session.add_torrent(params)
 
     # ── 元数据等待 ──
 
     def _wait_metadata(self):
+        if self._meta_prefetched:
+            # HTTP 预取已拿到元数据，无需 DHT 等待
+            return
+
         timeout = self.cfg.meta_timeout_sec
-        cprint(C.YELLOW, f"正在获取种子元数据（最长等待 {timeout}s）...")
+        cprint(C.YELLOW, f"正在通过 DHT 获取种子元数据（最长等待 {timeout}s）...")
         deadline = time.time() + timeout
         spin = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
         i = 0
-        while not self._handle.status().has_metadata:  # has_metadata() 在 2.0 中废弃，改用 status().has_metadata
+        while not self._handle.status().has_metadata:
             if self._stop.is_set():
                 raise InterruptedError("用户中断")
             if time.time() > deadline:
@@ -394,13 +462,17 @@ class MagnetDownloader:
     # ── 文件信息展示 ──
 
     def _show_torrent_info(self):
-        ti  = self._handle.get_torrent_info()
-        fs  = ti.files()
+        # torrent_file() 替代废弃的 get_torrent_info()
+        ti = self._handle.torrent_file()
+        if ti is None:
+            cprint(C.YELLOW, "元数据尚未就绪，跳过文件列表展示。")
+            return
+        fs = ti.files()
         cprint(C.BOLD + C.GREEN, "\n══════════════ 种子信息 ══════════════")
         print(f"  名称   : {ti.name()}")
         print(f"  总大小 : {fmt_size(ti.total_size())}")
         print(f"  文件数 : {ti.num_files()}")
-        cprint(C.BOLD + C.GREEN, "  包含视频:")
+        cprint(C.BOLD + C.GREEN, "  包含文件（视频）:")
         has_video = False
         for i in range(ti.num_files()):
             fname = fs.file_path(i)
@@ -410,6 +482,10 @@ class MagnetDownloader:
                 print(f"    {C.CYAN}{fname}{C.RESET}  ({fmt_size(fsize)})")
         if not has_video:
             cprint(C.YELLOW, "    （未检测到常见视频文件，将下载全部内容）")
+
+        # 磁力链不包含 HTTP 视频 URL，视频数据分散在 P2P 节点中
+        # 但下载完成后本地路径即为视频位置
+        cprint(C.DIM + C.BOLD + C.GREEN, "\n  ℹ  磁力链不含 HTTP URL，视频以分片形式存储于 P2P 网络")
         cprint(C.BOLD + C.GREEN, "══════════════════════════════════════\n")
 
     # ── 预览触发 ──
@@ -443,12 +519,29 @@ class MagnetDownloader:
 
     # ── 主下载循环 ──
 
+    def _dht_stats_updater(self):
+        """后台线程：每 5s 通过 post_dht_stats() 更新 DHT 节点数（替代废弃的 session.status()）。"""
+        while not self._stop.is_set():
+            try:
+                self._session.post_dht_stats()
+                time.sleep(0.2)
+                for a in self._session.pop_alerts():
+                    if hasattr(a, 'routing_table'):
+                        self._dht_nodes = sum(b.num_nodes for b in a.routing_table)
+                        break
+            except Exception:
+                pass
+            self._stop.wait(5)
+
     def download(self):
         os.makedirs(self.save_path, exist_ok=True)
         cprint(C.BOLD, f"下载目录: {self.save_path}")
 
         self._session = self._make_session()
         self._handle  = self._add_torrent()
+
+        # 后台更新 DHT 节点数
+        threading.Thread(target=self._dht_stats_updater, daemon=True, name="dht-stats").start()
 
         self._wait_metadata()
         self._show_torrent_info()
@@ -472,11 +565,8 @@ class MagnetDownloader:
 
             eta = fmt_eta((wanted - done) / dl_rate) if dl_rate > 0 and wanted > done else '--'
 
-            # DHT 节点数（用于诊断 peer 发现是否正常）
-            try:
-                dht_nodes = self._session.status().dht_nodes
-            except Exception:
-                dht_nodes = 0
+            # DHT 节点数 — session.status() 在 2.0 中废弃，改用 post_dht_stats() + alert
+            dht_nodes = self._dht_nodes
 
             bar  = self._progress_bar(pct)
             line = (
