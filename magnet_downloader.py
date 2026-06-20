@@ -451,21 +451,32 @@ class MagnetDownloader:
 # ──────────────────────────────────────────
 
 def main():
+    # ──────────────────────────────────────────────────────────
+    # 磁力链列表 —— 在此处添加要下载的磁力链接，支持多条
+    # ──────────────────────────────────────────────────────────
+    MAGNET_LINKS: List[str] = [
+        # 示例（取消注释并替换为真实磁力链接）：
+        # "magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&dn=Movie1",
+        # "magnet:?xt=urn:btih:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB&dn=Movie2",
+    ]
+
     d = DEFAULT  # 简写，方便在 help 字符串中引用
     parser = argparse.ArgumentParser(
         prog        = 'magnet_downloader',
         description = '磁力链视频下载工具（libtorrent 多线程分片）',
         epilog      = (
             "示例:\n"
-            '  python magnet_downloader.py "magnet:?xt=urn:btih:XXXX..."\n'
-            '  python magnet_downloader.py "magnet:?xt=urn:btih:XXXX..." -o ~/Videos\n'
-            '  python magnet_downloader.py "magnet:?xt=urn:btih:XXXX..." --no-preview\n'
+            "  python magnet_downloader.py                          # 下载代码中 MAGNET_LINKS 里的链接\n"
+            '  python magnet_downloader.py "magnet:?xt=urn:btih:XXXX..."  # 临时指定单条链接\n'
+            '  python magnet_downloader.py "magnet:?xt=..." -o ~/Videos\n'
             "\n默认值均来自文件顶部的 Config 配置项，可直接修改 DEFAULT 实例。\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('magnet',
-                        help='磁力链接（magnet:?xt=urn:btih:...）')
+    parser.add_argument('magnets',
+                        nargs='*',
+                        metavar='MAGNET',
+                        help='磁力链接（可选，若不传则使用代码中的 MAGNET_LINKS）')
     parser.add_argument('-o', '--output',
                         default=d.save_path,
                         dest='save_path',
@@ -491,16 +502,18 @@ def main():
                         help=f'元数据等待超时（秒，默认 {d.meta_timeout_sec}）')
     args = parser.parse_args()
 
-    # 解析磁力链
-    try:
-        info = parse_magnet(args.magnet)
-    except ValueError as e:
-        cprint(C.RED, f"解析失败: {e}")
+    # CLI 传入的链接追加到列表（去重）
+    for uri in args.magnets:
+        if uri not in MAGNET_LINKS:
+            MAGNET_LINKS.append(uri)
+
+    if not MAGNET_LINKS:
+        cprint(C.RED, "错误: 没有磁力链接可下载。")
+        cprint(C.YELLOW, "  方式一：在代码 main() 的 MAGNET_LINKS 列表中添加链接")
+        cprint(C.YELLOW, '  方式二：python magnet_downloader.py "magnet:?xt=urn:btih:XXXX..."')
         sys.exit(1)
 
-    print_magnet_info(info)
-
-    # 用命令行参数覆盖配置，构造本次运行的 Config
+    # 构造本次运行的 Config（CLI 参数覆盖默认值）
     cfg = Config(
         save_path         = args.save_path,
         connections       = args.connections,
@@ -512,28 +525,39 @@ def main():
         min_preview_mb    = DEFAULT.min_preview_mb,
     )
 
-    # 初始化下载器
-    downloader = MagnetDownloader(magnet_info=info, cfg=cfg)
+    cprint(C.BOLD, f"\n共 {len(MAGNET_LINKS)} 条磁力链接待下载")
 
-    # 捕获 Ctrl+C
-    def _sigint(sig, frame):
-        print()
-        cprint(C.YELLOW, "收到中断信号，正在停止...")
-        downloader.stop()
+    for idx, uri in enumerate(MAGNET_LINKS, 1):
+        cprint(C.BOLD + C.CYAN, f"\n[{idx}/{len(MAGNET_LINKS)}] 开始处理")
 
-    signal.signal(signal.SIGINT, _sigint)
+        # 解析磁力链
+        try:
+            info = parse_magnet(uri)
+        except ValueError as e:
+            cprint(C.RED, f"解析失败，跳过: {e}")
+            continue
 
-    # 开始下载
-    try:
-        downloader.download()
-    except TimeoutError as e:
-        cprint(C.RED, f"\n超时: {e}")
-        sys.exit(1)
-    except InterruptedError:
-        cprint(C.YELLOW, "已取消。")
-    except Exception as e:
-        cprint(C.RED, f"\n错误: {e}")
-        raise
+        print_magnet_info(info)
+
+        downloader = MagnetDownloader(magnet_info=info, cfg=cfg)
+
+        def _sigint(sig, frame):
+            print()
+            cprint(C.YELLOW, "收到中断信号，正在停止...")
+            downloader.stop()
+
+        signal.signal(signal.SIGINT, _sigint)
+
+        try:
+            downloader.download()
+        except TimeoutError as e:
+            cprint(C.RED, f"\n超时: {e}")
+        except InterruptedError:
+            cprint(C.YELLOW, "已取消。")
+            break
+        except Exception as e:
+            cprint(C.RED, f"\n错误: {e}")
+            raise
 
 
 if __name__ == '__main__':
