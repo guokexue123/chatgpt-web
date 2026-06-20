@@ -48,7 +48,7 @@ class Config:
     download_limit_kb:int   = 0      # 下载限速（KB/s），0 = 不限速
 
     # ── 元数据 ──
-    meta_timeout_sec: int   = 90     # 等待种子元数据的最长秒数
+    meta_timeout_sec: int   = 180    # 等待种子元数据的最长秒数（无 tracker 时需要更长时间）
 
     # ── 网络 ──
     listen_port:      int   = 6881   # 本地监听端口（需在路由器/防火墙开放此端口入站）
@@ -89,6 +89,14 @@ class MagnetInfo:
     info_hash:  str
     name:       str
     trackers:   List[str] = field(default_factory=list)
+    warnings:   List[str] = field(default_factory=list)
+
+
+# 已知的专有平台 biz 标识 → 提示文字
+_BIZ_WARNINGS: dict = {
+    'ktr': '迅雷专属资源（biz=ktr）：该资源主要依赖迅雷私有 P2P 网络，标准 BT 客户端只能靠 DHT 找节点，速度可能极慢甚至无法下载。建议改用迅雷客户端。',
+    'xl':  '迅雷专属资源（biz=xl）：同上，建议使用迅雷客户端。',
+}
 
 
 def parse_magnet(uri: str) -> MagnetInfo:
@@ -122,11 +130,19 @@ def parse_magnet(uri: str) -> MagnetInfo:
         import base64
         ih = base64.b32decode(ih.upper()).hex()
 
+    warns = []
+    biz = params.get('biz', '').lower()
+    if biz in _BIZ_WARNINGS:
+        warns.append(_BIZ_WARNINGS[biz])
+    if not trackers:
+        warns.append('磁力链中无 tracker（tr= 参数），仅靠 DHT 寻找节点，速度较慢且可能超时。')
+
     return MagnetInfo(
         raw       = uri,
         info_hash = ih.lower(),
         name      = params.get('dn', ih),
         trackers  = trackers,
+        warnings  = warns,
     )
 
 
@@ -139,6 +155,8 @@ def print_magnet_info(info: MagnetInfo):
         print(f"              {C.DIM}{t}{C.RESET}")
     if len(info.trackers) > 5:
         print(f"              ... 另有 {len(info.trackers)-5} 个")
+    for w in info.warnings:
+        cprint(C.YELLOW, f"\n  ⚠  {w}")
     cprint(C.BOLD + C.CYAN, "════════════════════════════════════════════\n")
 
 
@@ -301,20 +319,21 @@ class MagnetDownloader:
             except Exception:
                 pass
 
-        sess = lt.session(sp)
+        # DHT bootstrap 节点通过 settings 注入（libtorrent 2.0 新 API，替代废弃的 add_dht_router）
+        dht_nodes = ','.join([
+            "router.bittorrent.com:6881",
+            "router.utorrent.com:6881",
+            "dht.transmissionbt.com:6881",
+            "dht.aelitis.com:6881",
+            "router.bitcomet.com:6881",
+            "dht.libtorrent.org:25401",
+        ])
+        try:
+            sp.settings['dht_bootstrap_nodes'] = dht_nodes
+        except Exception:
+            pass
 
-        # DHT bootstrap 节点（尽量多）
-        for host, port in [
-            ("router.bittorrent.com",    6881),
-            ("router.utorrent.com",      6881),
-            ("dht.transmissionbt.com",   6881),
-            ("dht.aelitis.com",          6881),
-            ("router.bitcomet.com",      6881),
-            ("dht.libtorrent.org",       25401),
-        ]:
-            sess.add_dht_router(host, port)
-
-        return sess
+        return lt.session(sp)
 
     # 大量公共 tracker，注入每个种子以增加 peer 来源
     _PUBLIC_TRACKERS: List[str] = [
@@ -361,7 +380,7 @@ class MagnetDownloader:
         deadline = time.time() + timeout
         spin = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
         i = 0
-        while not self._handle.has_metadata():
+        while not self._handle.status().has_metadata:  # has_metadata() 在 2.0 中废弃，改用 status().has_metadata
             if self._stop.is_set():
                 raise InterruptedError("用户中断")
             if time.time() > deadline:
