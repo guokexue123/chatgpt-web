@@ -50,6 +50,9 @@ class Config:
     # ── 元数据 ──
     meta_timeout_sec: int   = 90     # 等待种子元数据的最长秒数
 
+    # ── 网络 ──
+    listen_port:      int   = 6881   # 本地监听端口（需在路由器/防火墙开放此端口入站）
+
     # ── 预览 ──
     preview:          bool  = True   # 是否在下载初期自动预览视频
     preview_sec:      int   = 5      # 预览时长（秒）
@@ -256,50 +259,98 @@ class MagnetDownloader:
 
     def _make_session(self) -> lt.session:
         sp = lt.session_params()
-        settings = {
-            # 连接数
-            'connections_limit':       self.connections,
-            # 上传/下载限速
-            'upload_rate_limit':       self.upload_limit,
-            'download_rate_limit':     self.dl_limit,
-            # 积极的 tracker 探测
-            'active_downloads':        10,
-            'active_seeds':            5,
-            'active_limit':            20,
-            # 启用 DHT / UPnP / LSD
-            'enable_dht':              True,
-            'enable_lsd':              True,
-            'enable_upnp':             True,
-            'enable_natpmp':           True,
-            # 顺序下载有助于边下边播
-            'strict_end_game_mode':    True,
-            # 用户代理
-            'user_agent':              'libtorrent/2.0',
-        }
         sp.settings = lt.default_settings()
-        for k, v in settings.items():
+
+        opts = {
+            # ── 连接数 / 限速 ──
+            'connections_limit':            self.connections,
+            'upload_rate_limit':            self.upload_limit,
+            'download_rate_limit':          self.dl_limit,
+            # ── 激进的 peer 发现 ──
+            'active_downloads':             20,
+            'active_seeds':                 5,
+            'active_limit':                 30,
+            'active_tracker_limit':         20,
+            'active_dht_limit':             80,
+            'active_lsd_limit':             60,
+            # ── 监听端口（固定端口便于路由器开放入站）──
+            'listen_interfaces':            f'0.0.0.0:{self.cfg.listen_port}',
+            # ── DHT / UPnP / LSD / NAT-PMP ──
+            'enable_dht':                   True,
+            'enable_lsd':                   True,
+            'enable_upnp':                  True,
+            'enable_natpmp':                True,
+            # ── Peer 交换 & 连接策略 ──
+            'peer_connect_timeout':         5,
+            'request_timeout':              10,
+            'max_allowed_in_request_queue': 2000,
+            'max_out_request_queue':        500,
+            'whole_pieces_threshold':       20,
+            'strict_end_game_mode':         True,
+            # ── Tracker 宣告间隔缩短（更快找到 peers）──
+            'min_announce_interval':        30,
+            'tracker_backoff':              0,
+            'announce_to_all_trackers':     True,  # 同时向所有 tracker 宣告
+            'announce_to_all_tiers':        True,
+            # ── 用户代理 ──
+            'user_agent':                   'qBittorrent/4.6.2',
+        }
+        for k, v in opts.items():
             try:
                 sp.settings[k] = v
             except Exception:
                 pass
 
         sess = lt.session(sp)
-        # 添加公共 DHT bootstrap 节点
+
+        # DHT bootstrap 节点（尽量多）
         for host, port in [
-            ("router.bittorrent.com",   6881),
-            ("router.utorrent.com",     6881),
-            ("dht.transmissionbt.com",  6881),
-            ("dht.aelitis.com",         6881),
+            ("router.bittorrent.com",    6881),
+            ("router.utorrent.com",      6881),
+            ("dht.transmissionbt.com",   6881),
+            ("dht.aelitis.com",          6881),
+            ("router.bitcomet.com",      6881),
+            ("dht.libtorrent.org",       25401),
         ]:
             sess.add_dht_router(host, port)
+
         return sess
+
+    # 大量公共 tracker，注入每个种子以增加 peer 来源
+    _PUBLIC_TRACKERS: List[str] = [
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://open.tracker.cl:1337/announce",
+        "udp://tracker.openbittorrent.com:6969/announce",
+        "udp://opentracker.i2p.rocks:6969/announce",
+        "udp://tracker.internetwarriors.net:1337/announce",
+        "udp://tracker.leechers-paradise.org:6969/announce",
+        "udp://tracker.coppersurfer.tk:6969/announce",
+        "udp://tracker.zer0day.to:1337/announce",
+        "udp://tracker.pirateparty.gr:6969/announce",
+        "udp://exodus.desync.com:6969/announce",
+        "udp://tracker.tiny-vps.com:6969/announce",
+        "udp://retracker.lanta-net.ru:2710/announce",
+        "udp://open.stealth.si:80/announce",
+        "udp://tracker.torrent.eu.org:451/announce",
+        "udp://tracker.moeking.me:6969/announce",
+        "https://tracker.gbitt.info/announce",
+        "https://tracker.tamersunion.org:443/announce",
+        "https://opentracker.i2p.rocks:443/announce",
+    ]
 
     def _add_torrent(self) -> lt.torrent_handle:
         params = lt.parse_magnet_uri(self.info.raw)
-        params.save_path     = self.save_path
-        params.storage_mode  = lt.storage_mode_t.storage_mode_sparse
-        # 顺序下载，前部分片优先——有利于边下边播
-        params.flags        |= lt.torrent_flags.sequential_download
+        params.save_path    = self.save_path
+        params.storage_mode = lt.storage_mode_t.storage_mode_sparse
+
+        # 注入公共 tracker（与磁力链自带 tracker 合并）
+        existing = set(params.trackers)
+        for t in self._PUBLIC_TRACKERS:
+            if t not in existing:
+                params.trackers.append(t)
+
+        # 不预设顺序下载：peer 少时随机分片更容易凑齐数据；
+        # 待下载达到一定量后可手动开启顺序（有助于边下边播）
         return self._session.add_torrent(params)
 
     # ── 元数据等待 ──
@@ -402,6 +453,12 @@ class MagnetDownloader:
 
             eta = fmt_eta((wanted - done) / dl_rate) if dl_rate > 0 and wanted > done else '--'
 
+            # DHT 节点数（用于诊断 peer 发现是否正常）
+            try:
+                dht_nodes = self._session.status().dht_nodes
+            except Exception:
+                dht_nodes = 0
+
             bar  = self._progress_bar(pct)
             line = (
                 f"\r{bar}  "
@@ -409,7 +466,7 @@ class MagnetDownloader:
                 f"↓{C.GREEN}{fmt_speed(dl_rate)}{C.RESET} "
                 f"↑{fmt_speed(ul_rate)}  "
                 f"{fmt_size(done)}/{fmt_size(wanted)}  "
-                f"P:{peers} S:{seeds}  "
+                f"P:{peers} S:{seeds} DHT:{dht_nodes}  "
                 f"ETA:{eta}   "
             )
             sys.stdout.write(line)
