@@ -33,6 +33,32 @@ try:
 except ImportError:
     HAS_TQDM = False
 
+
+# ══════════════════════════════════════════════
+# 配置项 —— 修改此处即可调整所有默认行为
+# ══════════════════════════════════════════════
+@dataclass
+class Config:
+    # 下载目录
+    save_path:        str   = './downloads'
+
+    # ── 连接 / 速度 ──
+    connections:      int   = 300    # 最大并发 peer 连接数
+    upload_limit_kb:  int   = 50     # 上传限速（KB/s），0 = 不限速
+    download_limit_kb:int   = 0      # 下载限速（KB/s），0 = 不限速
+
+    # ── 元数据 ──
+    meta_timeout_sec: int   = 90     # 等待种子元数据的最长秒数
+
+    # ── 预览 ──
+    preview:          bool  = True   # 是否在下载初期自动预览视频
+    preview_sec:      int   = 5      # 预览时长（秒）
+    min_preview_mb:   float = 8.0    # 触发预览所需的最少已下载量（MB）
+
+
+# 全局默认配置实例（argparse 从此处读取默认值）
+DEFAULT = Config()
+
 # 支持的视频格式
 VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.m2ts', '.rmvb', '.rm'}
 
@@ -207,25 +233,19 @@ def scan_videos(path: str) -> List[str]:
 
 class MagnetDownloader:
 
-    # 预览触发阈值：已下载至少 MIN_PREVIEW_MB MB 且尚未预览
-    MIN_PREVIEW_MB   = 8
-    META_TIMEOUT_SEC = 90    # 获取元数据最长等待时间
-
     def __init__(
         self,
-        magnet_info:    MagnetInfo,
-        save_path:      str,
-        preview:        bool  = True,
-        preview_sec:    int   = 5,
-        connections:    int   = 300,
-        upload_limit:   int   = 50 * 1024,   # 50 KB/s 上传限速（保护带宽）
+        magnet_info: MagnetInfo,
+        cfg:         Config = None,
     ):
-        self.info          = magnet_info
-        self.save_path     = os.path.abspath(save_path)
-        self.do_preview    = preview
-        self.preview_sec   = preview_sec
-        self.connections   = connections
-        self.upload_limit  = upload_limit
+        self.info         = magnet_info
+        self.cfg          = cfg or Config()
+        self.save_path    = os.path.abspath(self.cfg.save_path)
+        self.do_preview   = self.cfg.preview
+        self.preview_sec  = self.cfg.preview_sec
+        self.connections  = self.cfg.connections
+        self.upload_limit = self.cfg.upload_limit_kb * 1024
+        self.dl_limit     = self.cfg.download_limit_kb * 1024
 
         self._session:  Optional[lt.session]         = None
         self._handle:   Optional[lt.torrent_handle]  = None
@@ -239,8 +259,9 @@ class MagnetDownloader:
         settings = {
             # 连接数
             'connections_limit':       self.connections,
-            # 上传限速
+            # 上传/下载限速
             'upload_rate_limit':       self.upload_limit,
+            'download_rate_limit':     self.dl_limit,
             # 积极的 tracker 探测
             'active_downloads':        10,
             'active_seeds':            5,
@@ -284,8 +305,9 @@ class MagnetDownloader:
     # ── 元数据等待 ──
 
     def _wait_metadata(self):
-        cprint(C.YELLOW, "正在获取种子元数据（最长等待 90s）...")
-        deadline = time.time() + self.META_TIMEOUT_SEC
+        timeout = self.cfg.meta_timeout_sec
+        cprint(C.YELLOW, f"正在获取种子元数据（最长等待 {timeout}s）...")
+        deadline = time.time() + timeout
         spin = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
         i = 0
         while not self._handle.has_metadata():
@@ -325,7 +347,7 @@ class MagnetDownloader:
     def _maybe_preview(self, total_done: int):
         if self._previewed or not self.do_preview:
             return
-        if total_done < self.MIN_PREVIEW_MB * 1024 * 1024:
+        if total_done < self.cfg.min_preview_mb * 1024 * 1024:
             return
         videos = scan_videos(self.save_path)
         if not videos:
@@ -429,6 +451,7 @@ class MagnetDownloader:
 # ──────────────────────────────────────────
 
 def main():
+    d = DEFAULT  # 简写，方便在 help 字符串中引用
     parser = argparse.ArgumentParser(
         prog        = 'magnet_downloader',
         description = '磁力链视频下载工具（libtorrent 多线程分片）',
@@ -437,26 +460,35 @@ def main():
             '  python magnet_downloader.py "magnet:?xt=urn:btih:XXXX..."\n'
             '  python magnet_downloader.py "magnet:?xt=urn:btih:XXXX..." -o ~/Videos\n'
             '  python magnet_downloader.py "magnet:?xt=urn:btih:XXXX..." --no-preview\n'
+            "\n默认值均来自文件顶部的 Config 配置项，可直接修改 DEFAULT 实例。\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('magnet',
                         help='磁力链接（magnet:?xt=urn:btih:...）')
     parser.add_argument('-o', '--output',
-                        default='./downloads',
-                        help='保存目录（默认: ./downloads）')
+                        default=d.save_path,
+                        dest='save_path',
+                        metavar='DIR',
+                        help=f'保存目录（默认: {d.save_path}）')
     parser.add_argument('--no-preview',
                         action='store_true',
                         help='禁用视频预览')
     parser.add_argument('--preview-sec',
-                        type=int, default=5, metavar='N',
-                        help='预览时长（秒，默认 5）')
+                        type=int, default=d.preview_sec, metavar='N',
+                        help=f'预览时长（秒，默认 {d.preview_sec}）')
     parser.add_argument('--connections',
-                        type=int, default=300, metavar='N',
-                        help='最大并发连接数（默认 300）')
+                        type=int, default=d.connections, metavar='N',
+                        help=f'最大并发连接数（默认 {d.connections}）')
     parser.add_argument('--upload-limit',
-                        type=int, default=50, metavar='KB',
-                        help='上传限速 KB/s（默认 50，0=不限）')
+                        type=int, default=d.upload_limit_kb, metavar='KB',
+                        help=f'上传限速 KB/s（默认 {d.upload_limit_kb}，0=不限）')
+    parser.add_argument('--download-limit',
+                        type=int, default=d.download_limit_kb, metavar='KB',
+                        help=f'下载限速 KB/s（默认 {d.download_limit_kb}，0=不限）')
+    parser.add_argument('--meta-timeout',
+                        type=int, default=d.meta_timeout_sec, metavar='SEC',
+                        help=f'元数据等待超时（秒，默认 {d.meta_timeout_sec}）')
     args = parser.parse_args()
 
     # 解析磁力链
@@ -468,15 +500,20 @@ def main():
 
     print_magnet_info(info)
 
-    # 初始化下载器
-    downloader = MagnetDownloader(
-        magnet_info  = info,
-        save_path    = args.output,
-        preview      = not args.no_preview,
-        preview_sec  = args.preview_sec,
-        connections  = args.connections,
-        upload_limit = args.upload_limit * 1024,
+    # 用命令行参数覆盖配置，构造本次运行的 Config
+    cfg = Config(
+        save_path         = args.save_path,
+        connections       = args.connections,
+        upload_limit_kb   = args.upload_limit,
+        download_limit_kb = args.download_limit,
+        meta_timeout_sec  = args.meta_timeout,
+        preview           = not args.no_preview,
+        preview_sec       = args.preview_sec,
+        min_preview_mb    = DEFAULT.min_preview_mb,
     )
+
+    # 初始化下载器
+    downloader = MagnetDownloader(magnet_info=info, cfg=cfg)
 
     # 捕获 Ctrl+C
     def _sigint(sig, frame):
