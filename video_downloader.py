@@ -21,7 +21,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import httpx
 from playwright.async_api import async_playwright, Page, BrowserContext
@@ -164,7 +164,12 @@ async def _find_player_iframe_url(page: "Page", timeout: int = 15) -> str | None
             url = frame.url or ""
             if not url or not url.startswith("http"):
                 continue
-            if DOMAIN in url:
+            # 只比较主机名，避免 #supjav.com@... 这种 hash 片段误匹配
+            try:
+                host = urlparse(url).netloc
+            except Exception:
+                continue
+            if host == DOMAIN or host.endswith("." + DOMAIN):
                 continue
             if "challenges.cloudflare.com" in url:
                 continue
@@ -695,8 +700,24 @@ async def acquire_cookies() -> list[dict]:
 # ─────────────────────────────────────────────
 
 async def find_m3u8_via_network(page: Page, timeout: int) -> str | None:
+    """
+    监听页面网络请求，捕获 m3u8/HLS 流 URL。
+    检测逻辑（按优先级）：
+      1. URL 含 .m3u8 扩展名
+      2. 响应 Content-Type 含 mpegurl
+      3. 响应 body 以 #EXTM3U 开头（CDN 有时用无扩展名 + 非标准 Content-Type 服务 m3u8）
+    第 3 种情况：立即将 m3u8 内容写入本地文件（解析相对 URL 为绝对 URL），
+    以便 ffmpeg 从本地文件读取播放列表，避免 CDN token 7 秒过期导致 ffmpeg 无法
+    重新获取 manifest 而失败。
+    """
     found = asyncio.Event()
     result: list[str] = []
+
+    # 不可能是 m3u8 的响应类型 / URL 后缀
+    _SKIP_CT = ("image/", "font/", "text/javascript", "text/css", "text/html",
+                "application/javascript", "application/json")
+    _SKIP_EXT = ('.js', '.css', '.html', '.htm', '.json', '.png', '.jpg',
+                 '.jpeg', '.gif', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.ico')
 
     def _accept(url: str, content_type: str = "") -> bool:
         if ".m3u8" in url.lower():
@@ -704,17 +725,59 @@ async def find_m3u8_via_network(page: Page, timeout: int) -> str | None:
         ct = content_type.lower()
         return "mpegurl" in ct or "x-mpegurl" in ct
 
+    def _is_candidate(url: str, ct: str) -> bool:
+        """可能是无扩展名 m3u8 的 URL（排除明显非媒体响应）"""
+        ct_low = ct.lower()
+        if any(ct_low.startswith(t) for t in _SKIP_CT):
+            return False
+        url_low = url.lower().split("?")[0]
+        return not any(url_low.endswith(e) for e in _SKIP_EXT)
+
+    def _save_playlist(url: str, body: str) -> str:
+        """将 m3u8 内容写到本地文件（相对 URL → 绝对 URL），返回本地路径。"""
+        base = url.rsplit("/", 1)[0] + "/"
+        lines = []
+        for line in body.splitlines():
+            s = line.strip()
+            # 非注释、非空、非绝对 URL 的行 → 相对 URL → 转绝对
+            if s and not s.startswith("#") and not s.startswith("http"):
+                line = urljoin(base, s)
+            lines.append(line)
+        local = DOWNLOAD_DIR / "playlist_cache.m3u8"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text("\n".join(lines), encoding="utf-8")
+        return str(local)
+
     def on_request(r):
         if not result and _accept(r.url):
             result.append(r.url)
             found.set()
 
-    def on_response(r):
-        if not result:
-            ct = r.headers.get("content-type") or "" if hasattr(r, "headers") else ""
-            if _accept(r.url, ct):
+    async def on_response(r):
+        if result:
+            return
+        ct = ""
+        try:
+            ct = r.headers.get("content-type", "")
+        except Exception:
+            pass
+        if _accept(r.url, ct):
+            if not result:
                 result.append(r.url)
                 found.set()
+            return
+        # 对候选 URL，读取响应体检查是否为 HLS playlist
+        if not _is_candidate(r.url, ct):
+            return
+        try:
+            body = await r.text()
+            if body.strip().startswith("#EXTM3U") and not result:
+                local_path = _save_playlist(r.url, body)
+                print(f"\n  ✓ 网络拦截到 HLS playlist（无扩展名），已保存到本地: {local_path}")
+                result.append(local_path)
+                found.set()
+        except Exception:
+            pass
 
     def on_frame(f):
         if not result and _accept(f.url):
@@ -970,8 +1033,12 @@ def _find_ffmpeg() -> str | None:
 
 def download_m3u8_ffmpeg(m3u8_url: str, output_path: Path, ffmpeg_bin: str) -> bool:
     """使用 ffmpeg 下载（速度快，支持加密流）"""
+    is_local = Path(m3u8_url).exists() if not m3u8_url.startswith("http") else False
+    if is_local:
+        print(f"  使用本地缓存播放列表: {m3u8_url}")
     cmd = [
         ffmpeg_bin, "-y",
+        "-allowed_extensions", "ALL",      # 允许 m3u8 中包含任意扩展名的 segment
         "-headers", f"Referer: {TARGET_URL}\r\nUser-Agent: {USER_AGENT}\r\n",
         "-i", m3u8_url,
         "-c", "copy",
