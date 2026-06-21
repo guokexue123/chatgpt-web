@@ -699,6 +699,65 @@ async def acquire_cookies() -> list[dict]:
 # m3u8 提取
 # ─────────────────────────────────────────────
 
+async def _setup_playlist_capture(page: Page) -> list[str]:
+    """
+    在导航前注册路由拦截，捕获 CDN 签名 URL（含 expiry= 参数）中的 HLS playlist。
+    用 page.route() 而非 on_response，因为前者能在响应到达浏览器之前同步读取 body，
+    避免 async on_response 的时序问题。
+    找到 playlist 后立即放行后续请求（视频分段），不影响播放速度。
+    返回的列表会被追加本地 playlist 文件路径。
+    """
+    captured: list[str] = []
+    _SKIP_CT = ("image/", "font/", "text/javascript", "text/css",
+                "text/html", "application/javascript", "application/json")
+
+    def _save(url: str, text: str) -> str:
+        base = url.rsplit("/", 1)[0] + "/"
+        lines = []
+        for line in text.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#") and not s.startswith("http"):
+                line = urljoin(base, s)
+            lines.append(line)
+        local = DOWNLOAD_DIR / "playlist_cache.m3u8"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text("\n".join(lines), encoding="utf-8")
+        return str(local)
+
+    async def _handler(route, request):
+        if captured:               # 已拿到 playlist，后续分段直接放行
+            await route.continue_()
+            return
+        try:
+            response = await route.fetch()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+            return
+        if not captured:
+            try:
+                ct = response.headers.get("content-type", "")
+                if not any(ct.lower().startswith(t) for t in _SKIP_CT):
+                    body = await response.body()
+                    if 10 < len(body) < 500_000:
+                        text = body.decode("utf-8", errors="replace")
+                        if text.strip().startswith("#EXTM3U"):
+                            local = _save(request.url, text)
+                            captured.append(local)
+                            print(f"\n  ✓ 路由拦截到 HLS playlist → 已保存: {local}")
+            except Exception:
+                pass
+        try:
+            await route.fulfill(response=response)
+        except Exception:
+            pass
+
+    await page.route(re.compile(r".*[?&]expiry=\d{10,}"), _handler)
+    return captured
+
+
 async def find_m3u8_via_network(page: Page, timeout: int) -> str | None:
     """
     监听页面网络请求，捕获 m3u8/HLS 流 URL。
@@ -1155,7 +1214,12 @@ async def _extract_from_player_url(player_url: str) -> str | None:
             except Exception:
                 pass
 
-        # 开始网络监听
+        # 在导航前注册路由拦截——捕获 CDN 签名 URL 中的 HLS playlist
+        # CDN token 仅 ~7 秒有效，必须在 page.goto() 之前注册，才能在播放器
+        # 初始化阶段（CF 验证完成之前）拦截到 manifest 并保存到本地。
+        _pl_capture = await _setup_playlist_capture(page)
+
+        # 开始网络监听（备用：URL 含 .m3u8 或正确 Content-Type 时触发）
         m3u8_task = asyncio.create_task(find_m3u8_via_network(page, M3U8_TIMEOUT))
 
         print(f"  ▶ 加载播放器页面...")
@@ -1168,17 +1232,26 @@ async def _extract_from_player_url(player_url: str) -> str | None:
         await wait_for_player_cf(page)
         await asyncio.sleep(2)
 
-        # 尝试点击播放按钮
-        m3u8_url: str | None = None
-        if not m3u8_task.done():
+        # 路由拦截最优先：playlist 在 CF 验证期间就已保存
+        m3u8_url: str | None = _pl_capture[0] if _pl_capture else None
+        if m3u8_url:
+            print(f"  ✓ 使用路由拦截保存的本地 playlist")
+
+        # 尝试点击播放按钮（同时让 find_m3u8_via_network 有机会拿到 URL）
+        if not m3u8_url and not m3u8_task.done():
             print("  ▶ 触发播放...")
             await try_click_play(page)
             cf_cleared = await wait_for_player_cf(page)
             if cf_cleared:
                 await asyncio.sleep(2)
-                m3u8_url = await extract_m3u8_fallback(page)
-                if m3u8_url:
-                    print("  ✓ 从播放器 API 获取 URL（CF 通过后）")
+                # 再次检查路由拦截（点击播放后可能触发新的 CDN 请求）
+                if _pl_capture:
+                    m3u8_url = _pl_capture[0]
+                    print(f"  ✓ 使用路由拦截保存的本地 playlist（播放触发后）")
+                else:
+                    m3u8_url = await extract_m3u8_fallback(page)
+                    if m3u8_url:
+                        print("  ✓ 从播放器 API 获取 URL（CF 通过后）")
             if not m3u8_url:
                 await asyncio.sleep(1)
 
@@ -1197,7 +1270,7 @@ async def _extract_from_player_url(player_url: str) -> str | None:
                 except asyncio.TimeoutError:
                     pass
 
-        # 最终 DOM/JS 搜索
+        # 最终 DOM/JS 搜索（可能拿到已过期的 URL，但仍尝试）
         if not m3u8_url:
             m3u8_url = await extract_m3u8_fallback(page)
 
@@ -1327,6 +1400,10 @@ async def main():
                 find_m3u8_via_network(page, M3U8_TIMEOUT)
             )
 
+            # 路由拦截：DS 播放器初始化时会请求 CDN 签名 URL（~7 秒 token）
+            # 在点击服务器按钮之前设置，确保能拦截到 playlist 请求
+            _pl_capture = await _setup_playlist_capture(page)
+
             switched = await click_server_button(page, VIDEO_SERVER)
             # click_server_button 内部等待 5 秒——DS 播放器 iframe 在这段时间里
             # 完成加载并预取 m3u8，新 task 会自动捕获到。
@@ -1358,24 +1435,35 @@ async def main():
             for i, f in enumerate(page.frames):
                 print(f"    [{i}] {f.url}")
 
+            # 同样设置路由拦截（页面已加载，拦截后续 CDN 请求）
+            _pl_capture = await _setup_playlist_capture(page)
+
             _detected_player_url = await _find_player_iframe_url(page)
             if _detected_player_url:
                 print(f"  ✓ 自动检测到播放器 URL: {_detected_player_url[:80]}")
 
+        # 路由拦截最优先（在 CF 验证等待期间已拦截到 playlist）
+        m3u8_url: str | None = _pl_capture[0] if _pl_capture else None
+        if m3u8_url:
+            print(f"\n  ✓ 使用路由拦截保存的本地 playlist: {m3u8_url}")
+
         # 触发播放（如果 m3u8 尚未被预加载时捕获到）
-        m3u8_url: str | None = None
-        if not m3u8_task.done():
+        if not m3u8_url and not m3u8_task.done():
             print("\n  ▶ 触发视频播放...")
             await try_click_play(page)
             # 点击播放后检测 player iframe CF（点击可能触发 CF 验证）
             cf_cleared = await wait_for_player_cf(page)
             if cf_cleared:
-                # CF 通过后视频已开始播放，立即从播放器 API 读取 URL
-                # （video.currentSrc 在 iframe 里，extract_m3u8_fallback 会扫描所有 frame）
-                await asyncio.sleep(2)
-                m3u8_url = await extract_m3u8_fallback(page)
-                if m3u8_url:
-                    print(f"  ✓ CF 通过后从播放器 API 直接获取 URL（无需等待网络拦截）")
+                # 再次检查路由拦截（点击可能触发新的 CDN 请求）
+                if _pl_capture:
+                    m3u8_url = _pl_capture[0]
+                    print(f"  ✓ 使用路由拦截保存的本地 playlist（播放触发后）")
+                else:
+                    # CF 通过后视频已开始播放，立即从播放器 API 读取 URL
+                    await asyncio.sleep(2)
+                    m3u8_url = await extract_m3u8_fallback(page)
+                    if m3u8_url:
+                        print(f"  ✓ CF 通过后从播放器 API 直接获取 URL（无需等待网络拦截）")
             if not m3u8_url:
                 await asyncio.sleep(1)
 
