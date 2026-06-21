@@ -31,10 +31,18 @@ TARGET_URL = "https://supjav.com/132824.html"
 DOWNLOAD_DIR = Path("downloads")
 COOKIE_CACHE_FILE = Path("cookie_cache.json")
 
+# 【手动 Cookie 文件】把浏览器 F12 复制的 Cookie 字符串存入此文件即可
+# 支持三种格式（自动识别）：
+#   格式1 纯文本:  cf_clearance=xxx; _cfuvid=xxx
+#   格式2 JSON数组: [{"name":"cf_clearance","value":"xxx",...}, ...]
+#   格式3 脚本缓存: {"saved_at":..., "cookies":[...]}
+# 留空 "" 则跳过手动 Cookie，走自动获取流程
+BROWSER_COOKIE_FILE = "cookie_cache.json"   # 直接复用同一个文件，格式自动识别
+
 # --- 方案 A: playwright-stealth ---
 # 不需要额外配置，脚本自动处理
 STEALTH_HEADLESS = True          # 改为 False 可以看到浏览器（调试用）
-STEALTH_WAIT_SEC = 15            # 等待 CF 自动放行的秒数
+STEALTH_WAIT_SEC = 25            # 等待 CF 自动放行的秒数（增加到25秒）
 
 # --- 方案 B: FlareSolverr (本地 Docker) ---
 # 启动命令: docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
@@ -55,27 +63,84 @@ DOMAIN = urlparse(TARGET_URL).netloc
 
 
 # ─────────────────────────────────────────────
-# Cookie 缓存（避免每次都重新求解）
+# Cookie 工具（解析 / 缓存 / 从文件加载）
 # ─────────────────────────────────────────────
 
+def _parse_cookie_string(cookie_str: str, domain: str) -> list[dict]:
+    """把 F12 复制的 'name=value; name2=value2' 字符串解析成列表"""
+    cookies = []
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        cookies.append({
+            "name": name.strip(),
+            "value": value.strip(),
+            "domain": domain,
+            "path": "/",
+            "httpOnly": False,
+            "secure": True,
+            "sameSite": "None",
+        })
+    return cookies
+
+
+def load_cookies_from_file(path: str | Path) -> list[dict] | None:
+    """
+    从文件加载 Cookie，自动识别三种格式：
+      格式1 纯文本  : cf_clearance=xxx; _cfuvid=xxx
+      格式2 JSON数组: [{"name":"cf_clearance","value":"xxx",...}, ...]
+      格式3 脚本缓存: {"saved_at":..., "cookies":[...]}
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    content = p.read_text(encoding="utf-8").strip()
+    if not content:
+        return None
+
+    # 尝试 JSON 解析
+    if content.startswith("{") or content.startswith("["):
+        try:
+            data = json.loads(content)
+            # 格式3：脚本内部缓存格式
+            if isinstance(data, dict) and "cookies" in data:
+                remaining = 3000 - (time.time() - data.get("saved_at", 0))
+                if remaining <= 0:
+                    print(f"  ⚠ {p.name} 中的缓存 Cookie 已过期")
+                    return None
+                cookies = data["cookies"]
+                print(f"  ✓ 从 {p.name} 加载 {len(cookies)} 个 Cookie"
+                      f"（缓存格式，剩余约 {int(remaining/60)} 分钟）")
+                return cookies
+            # 格式2：JSON 数组
+            if isinstance(data, list):
+                cookies = _normalize_cookies(data, DOMAIN)
+                print(f"  ✓ 从 {p.name} 加载 {len(cookies)} 个 Cookie（JSON 数组格式）")
+                return cookies
+        except json.JSONDecodeError:
+            pass
+
+    # 格式1：纯文本 Cookie 字符串
+    if "=" in content:
+        cookies = _parse_cookie_string(content, DOMAIN)
+        if cookies:
+            print(f"  ✓ 从 {p.name} 加载 {len(cookies)} 个 Cookie（纯文本格式）")
+            return cookies
+
+    print(f"  ⚠ {p.name} 无法识别格式，内容预览: {content[:80]}")
+    return None
+
+
 def load_cached_cookies() -> list[dict] | None:
-    if not COOKIE_CACHE_FILE.exists():
-        return None
-    try:
-        data = json.loads(COOKIE_CACHE_FILE.read_text())
-        # cf_clearance 通常有效期 1 小时，保守取 50 分钟
-        if time.time() - data.get("saved_at", 0) > 3000:
-            print("  ⚠ 缓存 Cookie 已过期")
-            return None
-        print(f"  ✓ 使用缓存 Cookie（剩余约 {int((3000 - (time.time() - data['saved_at'])) / 60)} 分钟有效）")
-        return data["cookies"]
-    except Exception:
-        return None
+    """读取脚本自己写的 JSON 缓存（带时间戳）"""
+    return load_cookies_from_file(COOKIE_CACHE_FILE)
 
 
 def save_cookies(cookies: list[dict]):
     payload = {"saved_at": time.time(), "cookies": cookies}
-    COOKIE_CACHE_FILE.write_text(json.dumps(payload, indent=2))
+    COOKIE_CACHE_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
     print(f"  ✓ Cookie 已缓存到 {COOKIE_CACHE_FILE}")
 
 
@@ -131,45 +196,98 @@ async def get_cookies_via_stealth(url: str) -> list[dict] | None:
         print("  → 跳过方案A，尝试方案B/C")
         return None
 
+    # 方案A 先尝试 Firefox（TLS 指纹更像真实浏览器），再试 Chromium
+    for engine_name, launch_fn_attr, extra_args in [
+        ("Firefox",  "firefox",  []),
+        ("Chromium", "chromium", [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--disable-automation",
+            "--exclude-switches=enable-automation",
+            "--disable-infobars",
+            "--window-size=1920,1080",
+        ]),
+    ]:
+        print(f"  ▶ 尝试 {engine_name}...")
+        try:
+            result = await _stealth_attempt(apply_stealth, launch_fn_attr, extra_args, url)
+            if result:
+                return result
+        except Exception as e:
+            print(f"  ⚠ {engine_name} 失败: {e}")
+
+    print("  ✗ 方案A 未获得 cf_clearance（CF 仍在拦截）")
+    return None
+
+
+async def _stealth_attempt(apply_stealth, engine_attr: str, extra_args: list, url: str) -> list[dict] | None:
+    """实际执行一次 stealth 浏览器尝试"""
+    import random
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=STEALTH_HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        engine = getattr(p, engine_attr)
+        launch_kwargs: dict = {"headless": STEALTH_HEADLESS}
+        if extra_args:
+            launch_kwargs["args"] = extra_args
+
+        browser = await engine.launch(**launch_kwargs)
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1920, "height": 1080},
             locale="zh-CN",
         )
         page = await context.new_page()
-        await apply_stealth(page)
+
+        # 应用 stealth patch
+        try:
+            await apply_stealth(page)
+        except Exception as e:
+            print(f"  ⚠ apply_stealth 失败: {e}，继续（无 stealth）")
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception:
             pass
 
-        # 等待 CF 自动放行（CF JS Challenge 通常几秒内完成）
-        print(f"  ▶ 等待 CF 验证 {STEALTH_WAIT_SEC} 秒...")
-        for _ in range(STEALTH_WAIT_SEC):
+        # 模拟人类鼠标随机移动，帮助通过行为检测
+        try:
+            for _ in range(5):
+                await page.mouse.move(
+                    random.randint(200, 1600),
+                    random.randint(100, 800),
+                    steps=random.randint(5, 15),
+                )
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+        except Exception:
+            pass
+
+        # 等待 CF 放行
+        print(f"  ▶ 等待 CF 验证最多 {STEALTH_WAIT_SEC} 秒...")
+        for i in range(STEALTH_WAIT_SEC):
             await asyncio.sleep(1)
             cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in f.url]
             if not cf_frames:
+                print(f"  ✓ CF 验证在第 {i+1} 秒通过")
                 break
+            # 每5秒再移动一下鼠标
+            if i % 5 == 4:
+                try:
+                    await page.mouse.move(
+                        random.randint(300, 1500),
+                        random.randint(200, 700),
+                        steps=10,
+                    )
+                except Exception:
+                    pass
 
         raw = await context.cookies()
         await browser.close()
 
     cookies = _normalize_cookies(raw, DOMAIN)
     if has_cf_clearance(cookies):
-        print("  ✓ 方案A 成功获取 cf_clearance")
+        print(f"  ✓ 方案A ({engine_attr}) 成功获取 cf_clearance")
         return cookies
-
-    print("  ✗ 方案A 未获得 cf_clearance（CF 仍在拦截）")
     return None
 
 
@@ -397,15 +515,22 @@ def _normalize_cookies(raw: list[dict], domain: str) -> list[dict]:
 
 async def acquire_cookies() -> list[dict]:
     """
-    按优先级尝试三种方案，成功后缓存结果。
-    如果全部失败则退出。
+    按优先级尝试获取 Cookie：
+      0. 用户提供的 Cookie 文件（最高优先级，支持纯文本/JSON/缓存三种格式）
+      1. playwright-stealth 自动获取
+      2. FlareSolverr 本地服务
+      3. CapSolver 付费 API
     """
-    # 先检查缓存
-    cached = load_cached_cookies()
-    if cached:
-        return cached
+    # 优先级 0：用户手动提供的 Cookie 文件
+    if BROWSER_COOKIE_FILE:
+        file_cookies = load_cookies_from_file(BROWSER_COOKIE_FILE)
+        if file_cookies and has_cf_clearance(file_cookies):
+            print("  ✓ 使用手动提供的浏览器 Cookie")
+            return file_cookies
+        elif file_cookies:
+            print("  ⚠ Cookie 文件中没有 cf_clearance，继续自动获取...")
 
-    print("\n  ℹ 未找到有效缓存，开始自动获取 Cookie...")
+    print("\n  ℹ 开始自动获取 Cookie...")
 
     # 方案 A
     cookies = await get_cookies_via_stealth(TARGET_URL)
