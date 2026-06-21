@@ -148,26 +148,53 @@ async def wait_for_player_cf(page: "Page", timeout: int = PLAYER_CF_WAIT_SEC) ->
     return False
 
 
-def _find_player_iframe_url(page: "Page") -> str | None:
+async def _find_player_iframe_url(page: "Page", timeout: int = 15) -> str | None:
     """
-    扫描当前页面的所有 frames，找到播放器 iframe 的 URL。
-    排除：主页面 frame、about:blank、CF 验证 frame、广告/追踪 frame。
-    通常用于 DS 服务器切换后，自动捕获 playmogo.com/e/... 之类的播放器地址。
+    等待播放器 embed iframe URL 出现（最多 timeout 秒）。
+    优先匹配路径含 /e/、/embed 等 embed 模式的真正播放器，
+    避免误选 lk1.supremejav.com/supjav.php?l=... 这类会话绑定的中间包装页。
+    中间包装页通常先于内嵌播放器加载，需要等待嵌套 iframe 出现。
     """
-    for frame in page.frames:
-        url = frame.url or ""
-        if not url or url in ("about:blank", ""):
-            continue
-        if not url.startswith("http"):
-            continue
-        if DOMAIN in url:
-            continue
-        if "challenges.cloudflare.com" in url:
-            continue
-        if any(kw in url.lower() for kw in _AD_IFRAME_KEYWORDS):
-            continue
-        return url
-    return None
+    # 这些路径模式通常出现在真正的播放器 embed 页面
+    PLAYER_PATTERNS = ("/e/", "/embed", "/player/", "/hls/", "stream.")
+
+    def _candidates() -> list[str]:
+        urls = []
+        for frame in page.frames:
+            url = frame.url or ""
+            if not url or not url.startswith("http"):
+                continue
+            if DOMAIN in url:
+                continue
+            if "challenges.cloudflare.com" in url:
+                continue
+            if any(kw in url.lower() for kw in _AD_IFRAME_KEYWORDS):
+                continue
+            urls.append(url)
+        return urls
+
+    def _is_player(url: str) -> bool:
+        u = url.lower()
+        return any(p in u for p in PLAYER_PATTERNS)
+
+    fallback: str | None = None
+    for i in range(timeout):
+        cands = _candidates()
+        player_cands = [u for u in cands if _is_player(u)]
+        if player_cands:
+            if i > 0:
+                print(f"    （等待 {i+1} 秒后出现）")
+            return player_cands[0]
+        # 记录第一个非 player 候选作为兜底
+        if cands and fallback is None:
+            fallback = cands[0]
+        if i < timeout - 1:
+            await asyncio.sleep(1)
+
+    # 超时仍未找到 player 模式的 URL，返回兜底值（可能是包装页）
+    if fallback:
+        print(f"  ⚠ 未找到 embed 模式播放器，使用兜底 URL: {fallback[:80]}")
+    return fallback
 
 
 # ─────────────────────────────────────────────
@@ -1251,8 +1278,9 @@ async def main():
             for i, f in enumerate(page.frames):
                 print(f"    [{i}] {f.url}")
 
-            # 自动检测播放器 iframe URL，用于后续备用提取路径
-            _detected_player_url = _find_player_iframe_url(page)
+            # 自动检测播放器 iframe URL（等待嵌套 player embed 出现，最多15秒）
+            print("  ▶ 等待播放器 iframe 出现...")
+            _detected_player_url = await _find_player_iframe_url(page)
             if _detected_player_url:
                 print(f"  ✓ 自动检测到播放器 URL: {_detected_player_url[:80]}")
             else:
@@ -1263,7 +1291,7 @@ async def main():
             for i, f in enumerate(page.frames):
                 print(f"    [{i}] {f.url}")
 
-            _detected_player_url = _find_player_iframe_url(page)
+            _detected_player_url = await _find_player_iframe_url(page)
             if _detected_player_url:
                 print(f"  ✓ 自动检测到播放器 URL: {_detected_player_url[:80]}")
 
