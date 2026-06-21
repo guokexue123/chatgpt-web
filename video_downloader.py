@@ -65,6 +65,16 @@ FFMPEG_PATH = r"D:\Tool\ffmpeg\bin\ffmpeg.exe"
 # 常见值: "DS" / "TV" / "JPA" / "ST"，留空 "" 使用页面默认线路
 VIDEO_SERVER = "DS"
 
+# --- 播放器 Cloudflare 验证 ---
+# 某些视频播放器域名（如 playmogo.com）有自己的 CF 保护。
+# 脚本会等待最多这么多秒让它自动通过（stealth 模式下通常可自动解决）。
+# 若始终无法自动通过，将 BROWSER_HEADLESS 改为 False 手动完成验证。
+PLAYER_CF_WAIT_SEC = 30
+
+# --- 主下载浏览器 ---
+# True = 无头（正常使用）；False = 显示浏览器窗口（调试 / 手动过 CF 验证）
+BROWSER_HEADLESS = True
+
 # --- 方案 C: CapSolver API (付费) ---
 # 注册: https://capsolver.com  充值约 $2 可解数千次
 CAPSOLVER_API_KEY = ""           # 填入你的 API Key 启用此方案
@@ -84,6 +94,52 @@ _AD_IFRAME_KEYWORDS = (
     "tracker.", "tracking.", "analytics.", "metrics.", "pixel.",
     "campaign", "banner", "widget",
 )
+
+
+def _load_stealth_fn():
+    """返回 playwright-stealth 异步应用函数（兼容 v1/v2），不可用返回 None"""
+    try:
+        from playwright_stealth import stealth_async
+        return stealth_async
+    except ImportError:
+        pass
+    try:
+        from playwright_stealth import Stealth
+        s = Stealth()
+        for method in ["apply_stealth_async", "use_async", "async_stealth", "__call__"]:
+            fn = getattr(s, method, None)
+            if callable(fn):
+                return fn
+    except ImportError:
+        pass
+    return None
+
+
+async def wait_for_player_cf(page: "Page", timeout: int = PLAYER_CF_WAIT_SEC) -> bool:
+    """
+    检测并等待播放器 iframe 内的 CF 人机验证自动通过。
+    stealth 模式下 CF JS Challenge 通常几秒内自动解决；
+    若 CF 要求用户交互（Turnstile 复选框），需将 BROWSER_HEADLESS 改为 False。
+    返回 True 表示已通过或本来就无验证，False 表示超时仍未通过。
+    """
+    cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in (f.url or "")]
+    if not cf_frames:
+        return True
+
+    print(f"\n  ⚠ 播放器 iframe 内检测到 CF 人机验证，等待最多 {timeout} 秒自动通过...")
+    print(f"    （若长时间卡住，可将 BROWSER_HEADLESS = False 改为可见模式手动完成）")
+    for i in range(timeout):
+        await asyncio.sleep(1)
+        cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in (f.url or "")]
+        if not cf_frames:
+            print(f"  ✓ 第 {i+1} 秒：播放器 CF 验证已通过")
+            await asyncio.sleep(1)
+            return True
+        if (i + 1) % 5 == 0:
+            print(f"  ⏳ 已等待 {i+1}/{timeout} 秒...")
+
+    print(f"  ✗ {timeout} 秒内播放器 CF 验证未自动通过")
+    return False
 
 
 # ─────────────────────────────────────────────
@@ -186,41 +242,12 @@ async def get_cookies_via_stealth(url: str) -> list[dict] | None:
     """
     print("\n  [方案A] playwright-stealth 尝试获取 Cookie...")
 
-    # 兼容 playwright-stealth v1 和 v2，逐一尝试所有已知 API
-    apply_stealth = None
-    _import_errors: list[str] = []
-
-    # v1: from playwright_stealth import stealth_async
-    try:
-        from playwright_stealth import stealth_async as _fn
-        apply_stealth = _fn
-        print("  ✓ playwright-stealth v1 API (stealth_async)")
-    except Exception as e:
-        _import_errors.append(f"v1/stealth_async: {e}")
-
-    # v2 候选方法名（不同小版本名字不同）
+    apply_stealth = _load_stealth_fn()
     if apply_stealth is None:
-        _v2_methods = ["apply_stealth_async", "use_async", "async_stealth", "__call__"]
-        try:
-            from playwright_stealth import Stealth as _Stealth  # type: ignore
-            _s = _Stealth()
-            for _m in _v2_methods:
-                if callable(getattr(_s, _m, None)):
-                    apply_stealth = getattr(_s, _m)
-                    print(f"  ✓ playwright-stealth v2 API (Stealth.{_m})")
-                    break
-            if apply_stealth is None:
-                available = [a for a in dir(_s) if not a.startswith("_")]
-                _import_errors.append(f"v2/Stealth 存在但无可用异步方法，可用属性: {available}")
-        except Exception as e:
-            _import_errors.append(f"v2/Stealth: {e}")
-
-    if apply_stealth is None:
-        print("  ✗ 无法使用 playwright-stealth，详细错误:")
-        for err in _import_errors:
-            print(f"    • {err}")
-        print("  → 跳过方案A，尝试方案B/C")
+        print("  ✗ 无法导入 playwright-stealth，跳过方案A")
+        print("  → pip install playwright-stealth")
         return None
+    print("  ✓ playwright-stealth 已加载")
 
     # 方案A 先尝试 Firefox（TLS 指纹更像真实浏览器），再试 Chromium
     for engine_name, launch_fn_attr, extra_args in [
@@ -949,7 +976,7 @@ async def main():
 
     # 第二步：加载目标页面并截获 m3u8
     async with async_playwright() as p:
-        browser = await p.firefox.launch(headless=True)
+        browser = await p.firefox.launch(headless=BROWSER_HEADLESS)
         context: BrowserContext = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1920, "height": 1080},
@@ -957,6 +984,17 @@ async def main():
         await context.add_cookies(cookies)
 
         page = await context.new_page()
+
+        # 应用 stealth 伪装——有助于播放器 iframe（如 playmogo.com）内的
+        # CF 验证自动通过，不需要用户手动点击复选框
+        _stealth = _load_stealth_fn()
+        if _stealth:
+            try:
+                await _stealth(page)
+                print("  ✓ 已应用 stealth 伪装（有助于播放器 CF 验证自动通过）")
+            except Exception as e:
+                print(f"  ⚠ stealth 应用失败（继续）: {e}")
+
         m3u8_task = asyncio.create_task(find_m3u8_via_network(page, M3U8_TIMEOUT))
 
         print(f"\n  ▶ 加载页面: {TARGET_URL}")
@@ -1028,6 +1066,9 @@ async def main():
                 else:
                     print("  ✓ 等待播放触发...")
 
+            # 服务器切换后检测 player iframe 内的 CF 验证并等待通过
+            await wait_for_player_cf(page)
+
             # 打印切换后的 frame 列表（调试：看 DS 播放器加载了哪个 iframe）
             print("  ▶ 切换后页面 frames:")
             for i, f in enumerate(page.frames):
@@ -1042,6 +1083,8 @@ async def main():
         if not m3u8_task.done():
             print("\n  ▶ 触发视频播放...")
             await try_click_play(page)
+            # 点击播放后再次检测 player iframe CF（点击可能触发 CF 验证）
+            await wait_for_player_cf(page)
             await asyncio.sleep(3)
 
         # 等待网络拦截结果
