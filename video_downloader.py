@@ -31,13 +31,18 @@ TARGET_URL = "https://supjav.com/132824.html"
 DOWNLOAD_DIR = Path("downloads")
 COOKIE_CACHE_FILE = Path("cookie_cache.json")
 
-# 【手动 Cookie 文件】把浏览器 F12 复制的 Cookie 字符串存入此文件即可
-# 支持三种格式（自动识别）：
-#   格式1 纯文本:  cf_clearance=xxx; _cfuvid=xxx
-#   格式2 JSON数组: [{"name":"cf_clearance","value":"xxx",...}, ...]
-#   格式3 脚本缓存: {"saved_at":..., "cookies":[...]}
-# 留空 "" 则跳过手动 Cookie，走自动获取流程
-BROWSER_COOKIE_FILE = "cookie_cache.json"   # 直接复用同一个文件，格式自动识别
+# 【手动 Cookie 文件】把浏览器 F12 复制的 Cookie 字符串存入任意文件，在下面列出即可
+# 支持四种格式（自动识别）：
+#   格式1 纯文本 : cf_clearance=xxx; _cfuvid=xxx
+#   格式2 带引号 : "cf_clearance=xxx; _cfuvid=xxx"
+#   格式3 JSON数组: [{"name":"cf_clearance","value":"xxx",...}, ...]
+#   格式4 脚本缓存: {"saved_at":..., "cookies":[...]}
+# 脚本按列表顺序查找，找到包含 cf_clearance 的第一个文件就使用
+BROWSER_COOKIE_FILES = [
+    "cf_cookies.json",     # 用户自定义文件（优先）
+    "cookie_cache.json",   # 脚本自动缓存文件
+    "cookies.txt",         # 备用纯文本文件
+]
 
 # --- 方案 A: playwright-stealth ---
 # 不需要额外配置，脚本自动处理
@@ -264,15 +269,24 @@ async def _stealth_attempt(apply_stealth, engine_attr: str, extra_args: list, ur
         except Exception:
             pass
 
-        # 等待 CF 放行
+        # 等待 CF 放行：必须同时满足「无 challenge iframe」且「存在 cf_clearance cookie」
         print(f"  ▶ 等待 CF 验证最多 {STEALTH_WAIT_SEC} 秒...")
+        cf_solved = False
         for i in range(STEALTH_WAIT_SEC):
             await asyncio.sleep(1)
             cf_frames = [f for f in page.frames if "challenges.cloudflare.com" in f.url]
-            if not cf_frames:
-                print(f"  ✓ CF 验证在第 {i+1} 秒通过")
+            raw_now = await context.cookies()
+            got_clearance = any(c.get("name") == "cf_clearance" for c in raw_now)
+
+            if got_clearance:
+                print(f"  ✓ 第 {i+1} 秒：获得 cf_clearance，验证成功")
+                cf_solved = True
                 break
-            # 每5秒再移动一下鼠标
+            elif not cf_frames and i > 0:
+                # 无 challenge 但也无 cf_clearance：
+                # 可能是 IP 直接放行（不需要 cookie）或页面还没加载完
+                print(f"  ℹ 第 {i+1} 秒：无 challenge iframe，等待 cookie 写入...")
+            # 每5秒移动鼠标模拟人类行为
             if i % 5 == 4:
                 try:
                     await page.mouse.move(
@@ -282,6 +296,9 @@ async def _stealth_attempt(apply_stealth, engine_attr: str, extra_args: list, ur
                     )
                 except Exception:
                     pass
+
+        if not cf_solved:
+            print(f"  ✗ {STEALTH_WAIT_SEC} 秒内未获得 cf_clearance")
 
         raw = await context.cookies()
         await browser.close()
@@ -316,13 +333,22 @@ async def get_cookies_via_flaresolverr(url: str) -> list[dict] | None:
                     "maxTimeout": FLARESOLVERR_TIMEOUT * 1000,
                 },
             )
+        raw_text = resp.text.strip()
+        if not raw_text:
+            print(f"  ✗ FlareSolverr 返回空响应 (HTTP {resp.status_code})")
+            print(f"    可能原因: Docker 容器刚启动还未就绪，或请求被拒绝")
+            return None
         data = resp.json()
     except httpx.ConnectError:
-        print(f"  ✗ 无法连接 FlareSolverr，请确认 Docker 已启动")
-        print(f"    docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest")
+        print(f"  ✗ 无法连接 FlareSolverr（端口 8191 未监听）")
+        print(f"    启动命令: docker run -d -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"  ✗ FlareSolverr 响应不是有效 JSON: {e}")
+        print(f"    原始响应 (前200字符): {resp.text[:200]!r}")
         return None
     except Exception as e:
-        print(f"  ✗ FlareSolverr 请求失败: {e}")
+        print(f"  ✗ FlareSolverr 请求异常: {type(e).__name__}: {e}")
         return None
 
     if data.get("status") != "ok":
@@ -518,19 +544,22 @@ def _normalize_cookies(raw: list[dict], domain: str) -> list[dict]:
 async def acquire_cookies() -> list[dict]:
     """
     按优先级尝试获取 Cookie：
-      0. 用户提供的 Cookie 文件（最高优先级，支持纯文本/JSON/缓存三种格式）
+      0. BROWSER_COOKIE_FILES 列表中的文件（最高优先级，自动扫描）
       1. playwright-stealth 自动获取
       2. FlareSolverr 本地服务
       3. CapSolver 付费 API
     """
-    # 优先级 0：用户手动提供的 Cookie 文件
-    if BROWSER_COOKIE_FILE:
-        file_cookies = load_cookies_from_file(BROWSER_COOKIE_FILE)
+    # 优先级 0：按顺序扫描 BROWSER_COOKIE_FILES 列表
+    for fname in BROWSER_COOKIE_FILES:
+        fpath = Path(fname)
+        if not fpath.exists():
+            continue
+        file_cookies = load_cookies_from_file(fpath)
         if file_cookies and has_cf_clearance(file_cookies):
-            print("  ✓ 使用手动提供的浏览器 Cookie")
+            print(f"  ✓ 使用 {fname} 中的浏览器 Cookie")
             return file_cookies
         elif file_cookies:
-            print("  ⚠ Cookie 文件中没有 cf_clearance，继续自动获取...")
+            print(f"  ⚠ {fname} 中没有 cf_clearance，继续查找...")
 
     print("\n  ℹ 开始自动获取 Cookie...")
 
