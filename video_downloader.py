@@ -718,13 +718,46 @@ async def main():
         except Exception as e:
             print(f"  ⚠ 加载超时（继续）: {e}")
 
-        # 等待 CF 放行
+        # 等待 CF iframe 消失（最多15秒）
         for _ in range(15):
             if not any("challenges.cloudflare.com" in f.url for f in page.frames):
                 break
             await asyncio.sleep(1)
 
         await asyncio.sleep(3)
+
+        # ── 关键检测：CF 拦截页面 ──────────────────────────────────────────
+        # CF 可能以整页形式返回验证页（URL 不变，但内容是 CF 挑战），需单独检测
+        page_title = await page.title()
+        page_html_snippet = (await page.content())[:2000].lower()
+        cf_blocked = (
+            "performing security verification" in page_html_snippet
+            or "cf-browser-verification" in page_html_snippet
+            or "just a moment" in page_html_snippet
+            or "enable javascript and cookies" in page_html_snippet
+            or (page_title and "just a moment" in page_title.lower())
+        )
+        if cf_blocked:
+            screenshot = DOWNLOAD_DIR / "debug.png"
+            await page.screenshot(path=str(screenshot))
+            await browser.close()
+            print(f"\n  ✗ Cloudflare 仍在拦截（cf_clearance Cookie 已过期或 IP 不匹配）")
+            print(f"  截图: {screenshot}")
+            print()
+            print("  ━━━ 解决方法 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            print("  cf_clearance 与生成它的 IP 绑定，约 1 小时后失效。")
+            print()
+            print("  请按以下步骤获取新 Cookie：")
+            print("  1. 用浏览器打开目标页面，完成 CF 人机验证")
+            print("  2. 按 F12 → 网络 → 点击任意请求 → 找到「请求头」中的 Cookie 行")
+            print("  3. 复制整行 Cookie 值，替换 cf_cookies.json 中的内容")
+            print("     （格式：纯文本一行，或上方提供的 JSON 格式均可）")
+            print("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            # 只清除自动缓存，不删用户手动维护的 cf_cookies.json
+            if COOKIE_CACHE_FILE.exists():
+                COOKIE_CACHE_FILE.unlink()
+            sys.exit(1)
+        # ────────────────────────────────────────────────────────────────────
 
         # 调试：打印所有 frame
         print("  ▶ 页面 frames:")
@@ -753,14 +786,8 @@ async def main():
         if not m3u8_url:
             screenshot = DOWNLOAD_DIR / "debug.png"
             await page.screenshot(path=str(screenshot), full_page=True)
-            print(f"\n  ✗ 未找到 m3u8，截图: {screenshot}")
-            print(f"  当前 URL: {page.url}")
-
-            # Cookie 可能已失效，清除缓存让下次重新获取
-            if COOKIE_CACHE_FILE.exists():
-                COOKIE_CACHE_FILE.unlink()
-                print("  ℹ 已清除 Cookie 缓存，下次运行将重新获取")
-
+            print(f"\n  ✗ 未找到 m3u8（页面已正常加载，但未检测到视频流）")
+            print(f"  截图: {screenshot}  当前 URL: {page.url}")
             await browser.close()
             sys.exit(1)
 
