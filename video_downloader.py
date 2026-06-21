@@ -643,14 +643,32 @@ async def find_m3u8_via_network(page: Page, timeout: int) -> str | None:
     found = asyncio.Event()
     result: list[str] = []
 
-    def capture(url: str):
-        if ".m3u8" in url.lower() and not result:
-            result.append(url)
+    def _accept(url: str, content_type: str = "") -> bool:
+        if ".m3u8" in url.lower():
+            return True
+        ct = content_type.lower()
+        return "mpegurl" in ct or "x-mpegurl" in ct
+
+    def on_request(r):
+        if not result and _accept(r.url):
+            result.append(r.url)
             found.set()
 
-    page.on("request", lambda r: capture(r.url))
-    page.on("response", lambda r: capture(r.url))
-    page.on("framenavigated", lambda f: capture(f.url))
+    def on_response(r):
+        if not result:
+            ct = r.headers.get("content-type") or "" if hasattr(r, "headers") else ""
+            if _accept(r.url, ct):
+                result.append(r.url)
+                found.set()
+
+    def on_frame(f):
+        if not result and _accept(f.url):
+            result.append(f.url)
+            found.set()
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+    page.on("framenavigated", on_frame)
 
     try:
         await asyncio.wait_for(found.wait(), timeout=timeout)
@@ -810,32 +828,60 @@ async def try_click_play(page: Page):
 
 
 async def extract_m3u8_fallback(page: Page) -> str | None:
-    """DOM + JS 备用提取"""
-    for frame in [page] + page.frames:
+    """
+    DOM + JS 备用提取。
+    优先从各 iframe 的播放器 API / video 元素读取实际播放地址，
+    不限制必须包含 .m3u8（video.currentSrc 可能是无扩展名的流）。
+    """
+    # 收集所有非广告、非 CF 的 frame 上下文
+    ctxs = [page] + [
+        f for f in page.frames
+        if f.url
+        and "cloudflare.com" not in f.url
+        and not any(kw in f.url.lower() for kw in _AD_IFRAME_KEYWORDS)
+    ]
+
+    # ── 1. 播放器 API + video.currentSrc（在每个 frame 里尝试）──────────────
+    api_scripts = [
+        # HTML5 video 元素当前播放地址（最可靠，视频在播就有值）
+        "(() => { const v = document.querySelector('video'); return v && (v.currentSrc || v.src) || null; })()",
+        # JWPlayer
+        "(() => { try { return jwplayer().getPlaylistItem().file || null; } catch(e) { return null; } })()",
+        # VideoJS
+        "(() => { try { const p = videojs(document.querySelector('.video-js')); return p ? p.currentSrc() : null; } catch(e) { return null; } })()",
+    ]
+    for ctx in ctxs:
+        for script in api_scripts:
+            try:
+                r = await ctx.evaluate(script)
+                if r and isinstance(r, str) and r.startswith("http"):
+                    print(f"  ✓ 从播放器 API 获取 URL: {r[:80]}")
+                    return r
+            except Exception:
+                pass
+
+    # ── 2. 搜索页面 HTML / script 标签内的 m3u8 URL ─────────────────────────
+    for ctx in ctxs:
         try:
-            html = await frame.content()
+            html = await ctx.content()
             m = M3U8_RE.search(html)
             if m:
                 return m.group(0)
         except Exception:
             pass
 
-    for script in [
-        "(() => { try { return jwplayer().getPlaylistItem().file } catch(e) { return null } })()",
-        """(() => {
+    try:
+        r = await page.evaluate("""() => {
             for (const s of document.querySelectorAll('script')) {
                 const m = s.textContent.match(/https?:\\/\\/[^\\s"'<>]+\\.m3u8/i);
                 if (m) return m[0];
             }
             return null;
-        })()""",
-    ]:
-        try:
-            r = await page.evaluate(script)
-            if r and ".m3u8" in r.lower():
-                return r
-        except Exception:
-            pass
+        }""")
+        if r:
+            return r
+    except Exception:
+        pass
 
     return None
 
@@ -1080,22 +1126,38 @@ async def main():
                 print(f"    [{i}] {f.url}")
 
         # 触发播放（如果 m3u8 尚未被预加载时捕获到）
+        m3u8_url: str | None = None
         if not m3u8_task.done():
             print("\n  ▶ 触发视频播放...")
             await try_click_play(page)
-            # 点击播放后再次检测 player iframe CF（点击可能触发 CF 验证）
-            await wait_for_player_cf(page)
-            await asyncio.sleep(3)
+            # 点击播放后检测 player iframe CF（点击可能触发 CF 验证）
+            cf_cleared = await wait_for_player_cf(page)
+            if cf_cleared:
+                # CF 通过后视频已开始播放，立即从播放器 API 读取 URL
+                # （video.currentSrc 在 iframe 里，extract_m3u8_fallback 会扫描所有 frame）
+                await asyncio.sleep(2)
+                m3u8_url = await extract_m3u8_fallback(page)
+                if m3u8_url:
+                    print(f"  ✓ CF 通过后从播放器 API 直接获取 URL（无需等待网络拦截）")
+            if not m3u8_url:
+                await asyncio.sleep(1)
 
-        # 等待网络拦截结果
-        try:
-            m3u8_url = await asyncio.wait_for(
-                asyncio.shield(m3u8_task), timeout=30
-            ) if not m3u8_task.done() else m3u8_task.result()
-        except asyncio.TimeoutError:
-            m3u8_url = None
+        # 等待网络拦截结果（如果播放器 API 没拿到）
+        if not m3u8_url:
+            if m3u8_task.done():
+                try:
+                    m3u8_url = m3u8_task.result()
+                except Exception:
+                    m3u8_url = None
+            else:
+                try:
+                    m3u8_url = await asyncio.wait_for(
+                        asyncio.shield(m3u8_task), timeout=30
+                    )
+                except asyncio.TimeoutError:
+                    m3u8_url = None
 
-        # 备用方案
+        # 最终备用：DOM/JS 全量搜索
         if not m3u8_url:
             print("  ▶ 网络拦截无结果，尝试 DOM/JS 搜索...")
             m3u8_url = await extract_m3u8_fallback(page)
