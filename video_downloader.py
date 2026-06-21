@@ -100,29 +100,31 @@ def load_cookies_from_file(path: str | Path) -> list[dict] | None:
     if not content:
         return None
 
-    # 尝试 JSON 解析
-    if content.startswith("{") or content.startswith("["):
-        try:
-            data = json.loads(content)
-            # 格式3：脚本内部缓存格式
-            if isinstance(data, dict) and "cookies" in data:
-                remaining = 3000 - (time.time() - data.get("saved_at", 0))
-                if remaining <= 0:
-                    print(f"  ⚠ {p.name} 中的缓存 Cookie 已过期")
-                    return None
-                cookies = data["cookies"]
-                print(f"  ✓ 从 {p.name} 加载 {len(cookies)} 个 Cookie"
-                      f"（缓存格式，剩余约 {int(remaining/60)} 分钟）")
-                return cookies
-            # 格式2：JSON 数组
-            if isinstance(data, list):
-                cookies = _normalize_cookies(data, DOMAIN)
-                print(f"  ✓ 从 {p.name} 加载 {len(cookies)} 个 Cookie（JSON 数组格式）")
-                return cookies
-        except json.JSONDecodeError:
-            pass
+    # 先尝试 JSON 解析（覆盖格式2/3，以及格式4：JSON 编码的字符串 "xxx=yyy; ..."）
+    try:
+        data = json.loads(content)
+        # 格式4：整个内容是被双引号包裹的 JSON 字符串，解开后当纯文本处理
+        if isinstance(data, str):
+            content = data          # 剥掉外层引号，继续走下面的纯文本逻辑
+        # 格式3：脚本内部缓存格式 {"saved_at":..., "cookies":[...]}
+        elif isinstance(data, dict) and "cookies" in data:
+            remaining = 3000 - (time.time() - data.get("saved_at", 0))
+            if remaining <= 0:
+                print(f"  ⚠ {p.name} 中的缓存 Cookie 已过期")
+                return None
+            cookies = data["cookies"]
+            print(f"  ✓ 从 {p.name} 加载 {len(cookies)} 个 Cookie"
+                  f"（缓存格式，剩余约 {int(remaining/60)} 分钟）")
+            return cookies
+        # 格式2：JSON 数组
+        elif isinstance(data, list):
+            cookies = _normalize_cookies(data, DOMAIN)
+            print(f"  ✓ 从 {p.name} 加载 {len(cookies)} 个 Cookie（JSON 数组格式）")
+            return cookies
+    except json.JSONDecodeError:
+        pass
 
-    # 格式1：纯文本 Cookie 字符串
+    # 格式1/4：纯文本 Cookie 字符串（或解包后的 JSON 字符串）
     if "=" in content:
         cookies = _parse_cookie_string(content, DOMAIN)
         if cookies:
