@@ -77,6 +77,14 @@ M3U8_TIMEOUT = 60
 M3U8_RE = re.compile(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', re.IGNORECASE)
 DOMAIN = urlparse(TARGET_URL).netloc
 
+# 广告/追踪 iframe 关键词——触发播放时跳过这些 iframe，避免误点广告视频
+_AD_IFRAME_KEYWORDS = (
+    "mayzaent.", "googlesyndication.", "doubleclick.", "adnxs.",
+    "amazon-adsystem.", "creative.", "adtech.", "advertising.",
+    "tracker.", "tracking.", "analytics.", "metrics.", "pixel.",
+    "campaign", "banner", "widget",
+)
+
 
 # ─────────────────────────────────────────────
 # Cookie 工具（解析 / 缓存 / 从文件加载）
@@ -716,7 +724,12 @@ async def try_click_play(page: Page):
         "[class*='play']",
     ]
     for frame in page.frames:
-        if not frame.url or "cloudflare.com" in frame.url:
+        frame_url = frame.url or ""
+        if not frame_url or "cloudflare.com" in frame_url:
+            continue
+        # 跳过广告 iframe，避免误点广告视频
+        if any(kw in frame_url.lower() for kw in _AD_IFRAME_KEYWORDS):
+            print(f"  ⚠ 跳过广告 iframe: {frame_url[:80]}")
             continue
         for sel in iframe_selectors:
             try:
@@ -734,6 +747,9 @@ async def try_click_play(page: Page):
         try:
             ctx_url = getattr(ctx, "url", page.url) or ""
             if "cloudflare.com" in ctx_url:
+                continue
+            # 广告 iframe 同样跳过
+            if any(kw in ctx_url.lower() for kw in _AD_IFRAME_KEYWORDS):
                 continue
             count = await ctx.evaluate("""() => {
                 const vs = document.querySelectorAll('video');
@@ -994,15 +1010,22 @@ async def main():
         if VIDEO_SERVER:
             print(f"\n  ▶ 切换到 {VIDEO_SERVER} 服务器...")
             switched = await click_server_button(page, VIDEO_SERVER)
-            # 注意：不取消原 m3u8_task——DS 在按钮点击后 5 秒等待期间可能已发出 m3u8 请求，
-            # 原任务的监听器仍在运行，会自动捕获到。重启任务反而可能错过这段时间的请求。
+            if switched:
+                # 切换后重新开始监听：原 task 可能已捕获到切换前（TV 服务器）的 m3u8 URL，
+                # 即使 DNS 失败 request 事件也会触发，取消后重开确保抓到 DS 的流。
+                if not m3u8_task.done():
+                    m3u8_task.cancel()
+                m3u8_task = asyncio.create_task(
+                    find_m3u8_via_network(page, M3U8_TIMEOUT)
+                )
+                print("  ✓ 重新开始 m3u8 监听（DS 服务器）")
 
-            # 打印切换后的 frame 列表（调试用，看 DS 播放器加载了哪个 iframe）
+            # 打印切换后的 frame 列表（调试：看 DS 播放器加载了哪个 iframe）
             print("  ▶ 切换后页面 frames:")
             for i, f in enumerate(page.frames):
                 print(f"    [{i}] {f.url}")
         else:
-            # 未配置 VIDEO_SERVER 时打印 frames 供参考
+            # 未配置服务器时打印 frames 供参考
             print("  ▶ 页面 frames:")
             for i, f in enumerate(page.frames):
                 print(f"    [{i}] {f.url}")
