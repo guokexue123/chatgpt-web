@@ -673,17 +673,116 @@ async def extract_m3u8_fallback(page: Page) -> str | None:
 # 下载
 # ─────────────────────────────────────────────
 
-def download_m3u8(m3u8_url: str, output_path: Path) -> bool:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+def _find_ffmpeg() -> str | None:
+    """在系统 PATH 和 Windows 常见位置查找 ffmpeg"""
+    import shutil
+    # 先查 PATH
+    found = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
+    if found:
+        return found
+    # Windows 常见安装路径
+    win_paths = [
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
+    ]
+    for p in win_paths:
+        if Path(p).exists():
+            return p
+    return None
+
+
+def download_m3u8_ffmpeg(m3u8_url: str, output_path: Path, ffmpeg_bin: str) -> bool:
+    """使用 ffmpeg 下载（速度快，支持加密流）"""
     cmd = [
-        "ffmpeg", "-y",
+        ffmpeg_bin, "-y",
         "-headers", f"Referer: {TARGET_URL}\r\nUser-Agent: {USER_AGENT}\r\n",
         "-i", m3u8_url,
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         str(output_path),
     ]
+    print(f"  使用 ffmpeg: {ffmpeg_bin}")
     return subprocess.run(cmd).returncode == 0
+
+
+async def download_m3u8_python(m3u8_url: str, output_path: Path) -> bool:
+    """
+    纯 Python 备用下载器（不需要 ffmpeg）。
+    抓取 m3u8 → 逐段下载 .ts → 合并为 .ts 文件（可用 VLC 播放）。
+    不支持 AES 加密流，加密流需用 ffmpeg。
+    """
+    import urllib.parse
+
+    headers = {
+        "Referer": TARGET_URL,
+        "User-Agent": USER_AGENT,
+    }
+    base_url = m3u8_url.rsplit("/", 1)[0] + "/"
+
+    print("  使用内置 Python 下载器（无需 ffmpeg）")
+    async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True) as client:
+        # 1. 下载并解析 m3u8
+        resp = await client.get(m3u8_url)
+        playlist = resp.text
+
+        # 检测加密（EXT-X-KEY）
+        if "#EXT-X-KEY" in playlist:
+            print("  ⚠ 检测到加密流（AES-128），Python 下载器不支持")
+            print("  请安装 ffmpeg 后重试")
+            return False
+
+        # 提取所有 .ts 分片 URL
+        segments: list[str] = []
+        for line in playlist.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                url = line if line.startswith("http") else urllib.parse.urljoin(base_url, line)
+                segments.append(url)
+
+        if not segments:
+            print("  ✗ m3u8 中未找到分片")
+            return False
+
+        print(f"  ✓ 共 {len(segments)} 个分片，开始下载...")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        ts_output = output_path.with_suffix(".ts")
+
+        with open(ts_output, "wb") as out:
+            for i, seg_url in enumerate(segments, 1):
+                for attempt in range(3):
+                    try:
+                        seg_resp = await client.get(seg_url, timeout=20)
+                        out.write(seg_resp.content)
+                        break
+                    except Exception as e:
+                        if attempt == 2:
+                            print(f"  ✗ 分片 {i}/{len(segments)} 下载失败: {e}")
+                            return False
+                        await asyncio.sleep(1)
+
+                if i % 20 == 0 or i == len(segments):
+                    pct = int(i / len(segments) * 100)
+                    print(f"  ▶ 已下载 {i}/{len(segments)} 分片 ({pct}%)", end="\r")
+
+        print(f"\n  ✓ 下载完成: {ts_output}")
+        print("  ℹ 文件格式为 .ts，可用 VLC 播放，或安装 ffmpeg 后转为 .mp4：")
+        print(f'  ffmpeg -i "{ts_output}" -c copy "{output_path}"')
+        return True
+
+
+async def download_m3u8(m3u8_url: str, output_path: Path) -> bool:
+    """自动选择下载方式：优先 ffmpeg，不可用则用 Python 内置"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = _find_ffmpeg()
+    if ffmpeg:
+        return download_m3u8_ffmpeg(m3u8_url, output_path, ffmpeg)
+
+    print("  ⚠ 未找到 ffmpeg，使用内置 Python 下载器")
+    print("  建议安装 ffmpeg 获得更好兼容性：")
+    print("    winget install ffmpeg          (Windows 推荐)")
+    print("    或从 https://ffmpeg.org/download.html 下载后加入 PATH")
+    return await download_m3u8_python(m3u8_url, output_path)
 
 
 # ─────────────────────────────────────────────
@@ -797,10 +896,9 @@ async def main():
     # 第三步：下载
     output = DOWNLOAD_DIR / "video.mp4"
     print(f"\n  ▶ 开始下载 → {output}")
-    if download_m3u8(m3u8_url, output):
-        print(f"\n  ✓ 下载完成: {output}")
-    else:
-        print(f"\n  ✗ ffmpeg 下载失败，可手动执行:")
+    ok = await download_m3u8(m3u8_url, output)
+    if not ok:
+        print(f"\n  ✗ 下载失败，可手动用 ffmpeg 执行:")
         print(f'  ffmpeg -i "{m3u8_url}" -c copy output.mp4')
         sys.exit(1)
 
