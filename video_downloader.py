@@ -652,7 +652,7 @@ async def click_server_button(page: Page, server_name: str) -> bool:
             if await el.count() > 0:
                 await el.click(timeout=3000)
                 print(f"  ✓ 已切换到服务器: {server_name}（选择器: {sel}）")
-                await asyncio.sleep(2)   # 等待播放器重新加载
+                await asyncio.sleep(5)   # 等待播放器重新加载（DS 播放器需要更长时间）
                 return True
         except Exception:
             continue
@@ -671,27 +671,99 @@ async def click_server_button(page: Page, server_name: str) -> bool:
 
 
 async def try_click_play(page: Page):
-    for sel in ["video", ".vjs-big-play-button", ".play-btn", "[class*='play']", "#player"]:
+    # 先尝试将视频区域滚动到视口，某些播放器只在可见时才响应点击
+    try:
+        await page.evaluate(
+            "document.querySelector('video')?.scrollIntoView({behavior:'instant',block:'center'})"
+        )
+    except Exception:
+        pass
+
+    # ── DOM 点击（主页面）────────────────────────────────────────────────────
+    dom_selectors = [
+        "video",
+        ".vjs-big-play-button",
+        ".jw-display-icon-container",
+        ".jw-icon-display",
+        ".play-btn",
+        ".btn-play",
+        ".player-play-btn",
+        "[class*='play']",
+        "[aria-label*='play' i]",
+        "#player",
+    ]
+    for sel in dom_selectors:
         try:
             el = page.locator(sel).first
             if await el.count() > 0:
+                try:
+                    await el.scroll_into_view_if_needed()
+                except Exception:
+                    pass
                 await el.click(timeout=3000)
                 print(f"  ✓ 点击播放: {sel}")
                 return
         except Exception:
             pass
 
+    # ── DOM 点击（所有 iframe）──────────────────────────────────────────────
+    iframe_selectors = [
+        "video",
+        ".vjs-big-play-button",
+        ".jw-display-icon-container",
+        ".jw-icon-display",
+        ".play-btn",
+        "[class*='play']",
+    ]
     for frame in page.frames:
-        if frame.url and "cloudflare.com" not in frame.url:
-            for sel in ["video", ".vjs-big-play-button", ".play-btn"]:
-                try:
-                    el = frame.locator(sel).first
-                    if await el.count() > 0:
-                        await el.click(timeout=3000)
-                        print(f"  ✓ 在 iframe 中点击播放: {sel}")
-                        return
-                except Exception:
-                    pass
+        if not frame.url or "cloudflare.com" in frame.url:
+            continue
+        for sel in iframe_selectors:
+            try:
+                el = frame.locator(sel).first
+                if await el.count() > 0:
+                    await el.click(timeout=3000)
+                    print(f"  ✓ 在 iframe 中点击播放: {sel} ({frame.url[:70]})")
+                    return
+            except Exception:
+                pass
+
+    # ── JS 强制播放（主页面 + 所有 frame）───────────────────────────────────
+    print("  ▶ DOM 点击未命中，尝试 JS 强制播放...")
+    for ctx in [page] + list(page.frames):
+        try:
+            ctx_url = getattr(ctx, "url", page.url) or ""
+            if "cloudflare.com" in ctx_url:
+                continue
+            count = await ctx.evaluate("""() => {
+                const vs = document.querySelectorAll('video');
+                vs.forEach(v => { try { v.play(); } catch(e) {} });
+                return vs.length;
+            }""")
+            if count:
+                print(f"  ✓ JS video.play() 触发 {count} 个视频（{str(ctx_url)[:70]}）")
+                return
+        except Exception:
+            pass
+
+    # ── 播放器 API（JWPlayer / VideoJS）────────────────────────────────────
+    for js, label in [
+        ("try { jwplayer().play(); return true; } catch(e) { return false; }",
+         "jwplayer().play()"),
+        ("try { videojs(document.querySelector('.video-js')).play(); return true; } catch(e) { return false; }",
+         "videojs().play()"),
+        ("const p=document.querySelector('#player'); if(p&&p.play){p.play();return true;} return false;",
+         "#player.play()"),
+    ]:
+        try:
+            r = await page.evaluate(f"(() => {{ {js} }})()")
+            if r:
+                print(f"  ✓ {label} 触发播放")
+                return
+        except Exception:
+            pass
+
+    print("  ⚠ 未找到可触发的播放元素，等待播放器自动加载...")
 
 
 async def extract_m3u8_fallback(page: Page) -> str | None:
@@ -918,21 +990,22 @@ async def main():
             sys.exit(1)
         # ────────────────────────────────────────────────────────────────────
 
-        # 调试：打印所有 frame
-        print("  ▶ 页面 frames:")
-        for i, f in enumerate(page.frames):
-            print(f"    [{i}] {f.url}")
-
         # 切换视频服务器（在播放前点击指定线路按钮）
         if VIDEO_SERVER:
             print(f"\n  ▶ 切换到 {VIDEO_SERVER} 服务器...")
             switched = await click_server_button(page, VIDEO_SERVER)
-            if switched and not m3u8_task.done():
-                # 服务器切换后重新开始监听（旧 task 可能已捕获到切换前的 m3u8）
-                m3u8_task.cancel()
-                m3u8_task = asyncio.create_task(
-                    find_m3u8_via_network(page, M3U8_TIMEOUT)
-                )
+            # 注意：不取消原 m3u8_task——DS 在按钮点击后 5 秒等待期间可能已发出 m3u8 请求，
+            # 原任务的监听器仍在运行，会自动捕获到。重启任务反而可能错过这段时间的请求。
+
+            # 打印切换后的 frame 列表（调试用，看 DS 播放器加载了哪个 iframe）
+            print("  ▶ 切换后页面 frames:")
+            for i, f in enumerate(page.frames):
+                print(f"    [{i}] {f.url}")
+        else:
+            # 未配置 VIDEO_SERVER 时打印 frames 供参考
+            print("  ▶ 页面 frames:")
+            for i, f in enumerate(page.frames):
+                print(f"    [{i}] {f.url}")
 
         # 触发播放
         if not m3u8_task.done():
