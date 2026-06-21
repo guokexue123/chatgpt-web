@@ -56,9 +56,14 @@ FLARESOLVERR_TIMEOUT = 60        # 秒
 
 # --- ffmpeg 路径 ---
 # 留空 "" 则自动在 PATH 和常见目录中查找
-# Windows 示例: r"C:\ffmpeg\bin\ffmpeg.exe"
+# Windows 示例: r"D:\Tool\ffmpeg\bin\ffmpeg.exe"
 # macOS/Linux 示例: "/usr/local/bin/ffmpeg"
-FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
+FFMPEG_PATH = r"D:\Tool\ffmpeg\bin\ffmpeg.exe"
+
+# --- 视频服务器选择 ---
+# 页面上有多个线路按钮时，脚本会先点击指定服务器再播放
+# 常见值: "DS" / "TV" / "JPA" / "ST"，留空 "" 使用页面默认线路
+VIDEO_SERVER = "DS"
 
 # --- 方案 C: CapSolver API (付费) ---
 # 注册: https://capsolver.com  充值约 $2 可解数千次
@@ -620,6 +625,51 @@ async def find_m3u8_via_network(page: Page, timeout: int) -> str | None:
     return result[0] if result else None
 
 
+async def click_server_button(page: Page, server_name: str) -> bool:
+    """
+    点击视频服务器切换按钮（如 DS、TV、ST、JPA 等）。
+    点击后等待 2 秒让播放器重新初始化，再捕获新的 m3u8。
+    """
+    if not server_name:
+        return False
+
+    # 按文本内容匹配，覆盖常见的按钮/链接/列表项写法
+    selectors = [
+        f"button:text-is('{server_name}')",
+        f"a:text-is('{server_name}')",
+        f"li:text-is('{server_name}')",
+        f"span:text-is('{server_name}')",
+        f"div:text-is('{server_name}')",
+        f"[class*='server']:text-is('{server_name}')",
+        f"[class*='source']:text-is('{server_name}')",
+        # 宽松匹配（文本包含，可能误匹配但最后兜底）
+        f":text('{server_name}')",
+    ]
+
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if await el.count() > 0:
+                await el.click(timeout=3000)
+                print(f"  ✓ 已切换到服务器: {server_name}（选择器: {sel}）")
+                await asyncio.sleep(2)   # 等待播放器重新加载
+                return True
+        except Exception:
+            continue
+
+    # 所有选择器都失败，打印页面上的所有按钮文本帮助调试
+    try:
+        btn_texts = await page.evaluate("""() => {
+            const els = [...document.querySelectorAll('button, a, li, [class*="server"], [class*="source"]')];
+            return els.map(e => e.textContent.trim()).filter(t => t && t.length < 20);
+        }""")
+        unique = list(dict.fromkeys(btn_texts))[:30]
+        print(f"  ⚠ 未找到 '{server_name}' 按钮，页面上检测到的按钮文字: {unique}")
+    except Exception:
+        print(f"  ⚠ 未找到 '{server_name}' 按钮")
+    return False
+
+
 async def try_click_play(page: Page):
     for sel in ["video", ".vjs-big-play-button", ".play-btn", "[class*='play']", "#player"]:
         try:
@@ -873,7 +923,18 @@ async def main():
         for i, f in enumerate(page.frames):
             print(f"    [{i}] {f.url}")
 
-        # 尝试触发播放
+        # 切换视频服务器（在播放前点击指定线路按钮）
+        if VIDEO_SERVER:
+            print(f"\n  ▶ 切换到 {VIDEO_SERVER} 服务器...")
+            switched = await click_server_button(page, VIDEO_SERVER)
+            if switched and not m3u8_task.done():
+                # 服务器切换后重新开始监听（旧 task 可能已捕获到切换前的 m3u8）
+                m3u8_task.cancel()
+                m3u8_task = asyncio.create_task(
+                    find_m3u8_via_network(page, M3U8_TIMEOUT)
+                )
+
+        # 触发播放
         if not m3u8_task.done():
             print("\n  ▶ 触发视频播放...")
             await try_click_play(page)
