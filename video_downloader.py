@@ -54,6 +54,12 @@ STEALTH_WAIT_SEC = 25            # 等待 CF 自动放行的秒数（增加到25
 FLARESOLVERR_URL = "http://localhost:8191/v1"
 FLARESOLVERR_TIMEOUT = 60        # 秒
 
+# --- ffmpeg 路径 ---
+# 留空 "" 则自动在 PATH 和常见目录中查找
+# Windows 示例: r"C:\ffmpeg\bin\ffmpeg.exe"
+# macOS/Linux 示例: "/usr/local/bin/ffmpeg"
+FFMPEG_PATH = r"C:\ffmpeg\bin\ffmpeg.exe"
+
 # --- 方案 C: CapSolver API (付费) ---
 # 注册: https://capsolver.com  充值约 $2 可解数千次
 CAPSOLVER_API_KEY = ""           # 填入你的 API Key 启用此方案
@@ -674,19 +680,23 @@ async def extract_m3u8_fallback(page: Page) -> str | None:
 # ─────────────────────────────────────────────
 
 def _find_ffmpeg() -> str | None:
-    """在系统 PATH 和 Windows 常见位置查找 ffmpeg"""
+    """查找 ffmpeg：优先使用 FFMPEG_PATH 配置，再查 PATH 和常见目录"""
     import shutil
-    # 先查 PATH
+    # 1. 用户手动配置的路径
+    if FFMPEG_PATH:
+        if Path(FFMPEG_PATH).exists():
+            return FFMPEG_PATH
+        print(f"  ⚠ FFMPEG_PATH 指定的路径不存在: {FFMPEG_PATH}")
+    # 2. 系统 PATH
     found = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if found:
         return found
-    # Windows 常见安装路径
-    win_paths = [
+    # 3. Windows 常见安装路径
+    for p in [
         r"C:\ffmpeg\bin\ffmpeg.exe",
         r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
         r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe",
-    ]
-    for p in win_paths:
+    ]:
         if Path(p).exists():
             return p
     return None
