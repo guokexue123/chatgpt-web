@@ -91,13 +91,31 @@ async def get_cookies_via_stealth(url: str) -> list[dict] | None:
     """
     使用 playwright-stealth 伪装浏览器指纹，让 CF 认为是真人。
     对 CF JS Challenge 有效，对 Turnstile 成功率约 30-50%。
+    兼容 playwright-stealth v1（stealth_async）和 v2（Stealth 类）。
     """
     print("\n  [方案A] playwright-stealth 尝试获取 Cookie...")
+
+    # 兼容 v1 和 v2 两种 API
+    apply_stealth = None
     try:
-        from playwright_stealth import stealth_async
+        from playwright_stealth import stealth_async as _stealth_async
+        apply_stealth = _stealth_async
+        print("  ✓ 检测到 playwright-stealth v1 (stealth_async)")
     except ImportError:
-        print("  ⚠ 未安装 playwright-stealth，跳过方案A")
-        print("    安装命令: pip install playwright-stealth")
+        pass
+
+    if apply_stealth is None:
+        try:
+            from playwright_stealth import Stealth as _Stealth
+            _s = _Stealth()
+            apply_stealth = _s.apply_stealth_async
+            print("  ✓ 检测到 playwright-stealth v2 (Stealth.apply_stealth_async)")
+        except (ImportError, AttributeError):
+            pass
+
+    if apply_stealth is None:
+        print("  ✗ 无法导入 playwright-stealth，请检查安装")
+        print("    pip show playwright-stealth")
         return None
 
     async with async_playwright() as p:
@@ -115,7 +133,7 @@ async def get_cookies_via_stealth(url: str) -> list[dict] | None:
             locale="zh-CN",
         )
         page = await context.new_page()
-        await stealth_async(page)
+        await apply_stealth(page)
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
