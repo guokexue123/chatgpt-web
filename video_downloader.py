@@ -95,27 +95,40 @@ async def get_cookies_via_stealth(url: str) -> list[dict] | None:
     """
     print("\n  [方案A] playwright-stealth 尝试获取 Cookie...")
 
-    # 兼容 v1 和 v2 两种 API
+    # 兼容 playwright-stealth v1 和 v2，逐一尝试所有已知 API
     apply_stealth = None
+    _import_errors: list[str] = []
+
+    # v1: from playwright_stealth import stealth_async
     try:
-        from playwright_stealth import stealth_async as _stealth_async
-        apply_stealth = _stealth_async
-        print("  ✓ 检测到 playwright-stealth v1 (stealth_async)")
-    except ImportError:
-        pass
+        from playwright_stealth import stealth_async as _fn
+        apply_stealth = _fn
+        print("  ✓ playwright-stealth v1 API (stealth_async)")
+    except Exception as e:
+        _import_errors.append(f"v1/stealth_async: {e}")
 
+    # v2 候选方法名（不同小版本名字不同）
     if apply_stealth is None:
+        _v2_methods = ["apply_stealth_async", "use_async", "async_stealth", "__call__"]
         try:
-            from playwright_stealth import Stealth as _Stealth
+            from playwright_stealth import Stealth as _Stealth  # type: ignore
             _s = _Stealth()
-            apply_stealth = _s.apply_stealth_async
-            print("  ✓ 检测到 playwright-stealth v2 (Stealth.apply_stealth_async)")
-        except (ImportError, AttributeError):
-            pass
+            for _m in _v2_methods:
+                if callable(getattr(_s, _m, None)):
+                    apply_stealth = getattr(_s, _m)
+                    print(f"  ✓ playwright-stealth v2 API (Stealth.{_m})")
+                    break
+            if apply_stealth is None:
+                available = [a for a in dir(_s) if not a.startswith("_")]
+                _import_errors.append(f"v2/Stealth 存在但无可用异步方法，可用属性: {available}")
+        except Exception as e:
+            _import_errors.append(f"v2/Stealth: {e}")
 
     if apply_stealth is None:
-        print("  ✗ 无法导入 playwright-stealth，请检查安装")
-        print("    pip show playwright-stealth")
+        print("  ✗ 无法使用 playwright-stealth，详细错误:")
+        for err in _import_errors:
+            print(f"    • {err}")
+        print("  → 跳过方案A，尝试方案B/C")
         return None
 
     async with async_playwright() as p:
