@@ -1009,16 +1009,24 @@ async def main():
         # 切换视频服务器（在播放前点击指定线路按钮）
         if VIDEO_SERVER:
             print(f"\n  ▶ 切换到 {VIDEO_SERVER} 服务器...")
+            # ★ 关键：在点击按钮之前重置监听，保证 DS 播放器 iframe 初始化时
+            #   发出的 m3u8 预加载请求（VideoJS 会在播放前自动 prefetch manifest）
+            #   能被新 task 捕获。若在点击后再重置，预加载请求已经过去了。
+            if not m3u8_task.done():
+                m3u8_task.cancel()
+            m3u8_task = asyncio.create_task(
+                find_m3u8_via_network(page, M3U8_TIMEOUT)
+            )
+
             switched = await click_server_button(page, VIDEO_SERVER)
+            # click_server_button 内部等待 5 秒——DS 播放器 iframe 在这段时间里
+            # 完成加载并预取 m3u8，新 task 会自动捕获到。
+
             if switched:
-                # 切换后重新开始监听：原 task 可能已捕获到切换前（TV 服务器）的 m3u8 URL，
-                # 即使 DNS 失败 request 事件也会触发，取消后重开确保抓到 DS 的流。
-                if not m3u8_task.done():
-                    m3u8_task.cancel()
-                m3u8_task = asyncio.create_task(
-                    find_m3u8_via_network(page, M3U8_TIMEOUT)
-                )
-                print("  ✓ 重新开始 m3u8 监听（DS 服务器）")
+                if m3u8_task.done():
+                    print("  ✓ DS 播放器预加载期间已捕获 m3u8")
+                else:
+                    print("  ✓ 等待播放触发...")
 
             # 打印切换后的 frame 列表（调试：看 DS 播放器加载了哪个 iframe）
             print("  ▶ 切换后页面 frames:")
@@ -1030,7 +1038,7 @@ async def main():
             for i, f in enumerate(page.frames):
                 print(f"    [{i}] {f.url}")
 
-        # 触发播放
+        # 触发播放（如果 m3u8 尚未被预加载时捕获到）
         if not m3u8_task.done():
             print("\n  ▶ 触发视频播放...")
             await try_click_play(page)
