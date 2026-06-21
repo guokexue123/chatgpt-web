@@ -35,7 +35,7 @@ COOKIE_CACHE_FILE = Path("cookie_cache.json")
 # 如果你已经从浏览器 F12 拿到了具体的播放器 iframe URL（如 playmogo.com/e/...），
 # 填在这里即可跳过主页面加载和服务器切换，直接加载播放器页面提取 m3u8。
 # 留空 "" 则走正常流程（从 TARGET_URL 开始）。
-PLAYER_URL = "https://playmogo.com/e/sn73ykay1mib2firx8b4r9a71d4q18s#supjav.com@dvde"
+PLAYER_URL = ""
 
 # 【手动 Cookie 文件】把浏览器 F12 复制的 Cookie 字符串存入任意文件，在下面列出即可
 # 支持四种格式（自动识别）：
@@ -146,6 +146,28 @@ async def wait_for_player_cf(page: "Page", timeout: int = PLAYER_CF_WAIT_SEC) ->
 
     print(f"  ✗ {timeout} 秒内播放器 CF 验证未自动通过")
     return False
+
+
+def _find_player_iframe_url(page: "Page") -> str | None:
+    """
+    扫描当前页面的所有 frames，找到播放器 iframe 的 URL。
+    排除：主页面 frame、about:blank、CF 验证 frame、广告/追踪 frame。
+    通常用于 DS 服务器切换后，自动捕获 playmogo.com/e/... 之类的播放器地址。
+    """
+    for frame in page.frames:
+        url = frame.url or ""
+        if not url or url in ("about:blank", ""):
+            continue
+        if not url.startswith("http"):
+            continue
+        if DOMAIN in url:
+            continue
+        if "challenges.cloudflare.com" in url:
+            continue
+        if any(kw in url.lower() for kw in _AD_IFRAME_KEYWORDS):
+            continue
+        return url
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -1197,6 +1219,8 @@ async def main():
             sys.exit(1)
         # ────────────────────────────────────────────────────────────────────
 
+        _detected_player_url: str | None = None
+
         # 切换视频服务器（在播放前点击指定线路按钮）
         if VIDEO_SERVER:
             print(f"\n  ▶ 切换到 {VIDEO_SERVER} 服务器...")
@@ -1226,11 +1250,22 @@ async def main():
             print("  ▶ 切换后页面 frames:")
             for i, f in enumerate(page.frames):
                 print(f"    [{i}] {f.url}")
+
+            # 自动检测播放器 iframe URL，用于后续备用提取路径
+            _detected_player_url = _find_player_iframe_url(page)
+            if _detected_player_url:
+                print(f"  ✓ 自动检测到播放器 URL: {_detected_player_url[:80]}")
+            else:
+                print("  ⚠ 未检测到播放器 iframe（将继续常规提取流程）")
         else:
             # 未配置服务器时打印 frames 供参考
             print("  ▶ 页面 frames:")
             for i, f in enumerate(page.frames):
                 print(f"    [{i}] {f.url}")
+
+            _detected_player_url = _find_player_iframe_url(page)
+            if _detected_player_url:
+                print(f"  ✓ 自动检测到播放器 URL: {_detected_player_url[:80]}")
 
         # 触发播放（如果 m3u8 尚未被预加载时捕获到）
         m3u8_url: str | None = None
@@ -1270,15 +1305,30 @@ async def main():
             m3u8_url = await extract_m3u8_fallback(page)
 
         if not m3u8_url:
-            screenshot = DOWNLOAD_DIR / "debug.png"
-            await page.screenshot(path=str(screenshot), full_page=True)
-            print(f"\n  ✗ 未找到 m3u8（页面已正常加载，但未检测到视频流）")
-            print(f"  截图: {screenshot}  当前 URL: {page.url}")
+            if _detected_player_url:
+                # 常规流程未拿到流，但有播放器 iframe URL——关闭当前浏览器，
+                # 用专用函数直接加载播放器页面重新提取
+                print(f"\n  ▶ 常规提取失败，切换到直接播放器模式...")
+                print(f"    播放器: {_detected_player_url[:80]}")
+                await browser.close()
+            else:
+                screenshot = DOWNLOAD_DIR / "debug.png"
+                await page.screenshot(path=str(screenshot), full_page=True)
+                print(f"\n  ✗ 未找到 m3u8（页面已正常加载，但未检测到视频流）")
+                print(f"  截图: {screenshot}  当前 URL: {page.url}")
+                await browser.close()
+                sys.exit(1)
+        else:
+            print(f"\n  ✓ m3u8 URL:\n    {m3u8_url}")
             await browser.close()
-            sys.exit(1)
 
+    # 若常规流程失败但检测到了播放器 iframe URL，直接加载播放器页面提取
+    if not m3u8_url and _detected_player_url:
+        m3u8_url = await _extract_from_player_url(_detected_player_url)
+        if not m3u8_url:
+            print("\n  ✗ 未能从播放器 URL 中提取视频流")
+            sys.exit(1)
         print(f"\n  ✓ m3u8 URL:\n    {m3u8_url}")
-        await browser.close()
 
     # 第三步：下载
     output = DOWNLOAD_DIR / "video.mp4"
