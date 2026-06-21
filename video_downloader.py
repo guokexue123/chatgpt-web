@@ -31,6 +31,12 @@ TARGET_URL = "https://supjav.com/132824.html"
 DOWNLOAD_DIR = Path("downloads")
 COOKIE_CACHE_FILE = Path("cookie_cache.json")
 
+# 【直接指定播放器 URL】
+# 如果你已经从浏览器 F12 拿到了具体的播放器 iframe URL（如 playmogo.com/e/...），
+# 填在这里即可跳过主页面加载和服务器切换，直接加载播放器页面提取 m3u8。
+# 留空 "" 则走正常流程（从 TARGET_URL 开始）。
+PLAYER_URL = "https://playmogo.com/e/sn73ykay1mib2firx8b4r9a71d4q18s#supjav.com@dvde"
+
 # 【手动 Cookie 文件】把浏览器 F12 复制的 Cookie 字符串存入任意文件，在下面列出即可
 # 支持四种格式（自动识别）：
 #   格式1 纯文本 : cf_clearance=xxx; _cfuvid=xxx
@@ -1007,6 +1013,88 @@ async def download_m3u8(m3u8_url: str, output_path: Path) -> bool:
 
 
 # ─────────────────────────────────────────────
+# 播放器 URL 直接提取（PLAYER_URL 快捷路径）
+# ─────────────────────────────────────────────
+
+async def _extract_from_player_url(player_url: str) -> str | None:
+    """
+    直接加载播放器页面（如 playmogo.com/e/...），等待 CF 验证通过，
+    点击播放，然后从 video.currentSrc / 网络拦截中提取视频流 URL。
+    不需要 supjav.com 的 cf_clearance Cookie。
+    """
+    async with async_playwright() as p:
+        browser = await p.firefox.launch(headless=BROWSER_HEADLESS)
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1920, "height": 1080},
+        )
+        page = await context.new_page()
+
+        # 应用 stealth，有助于播放器 CF 自动通过
+        _stealth = _load_stealth_fn()
+        if _stealth:
+            try:
+                await _stealth(page)
+                print("  ✓ stealth 已应用")
+            except Exception:
+                pass
+
+        # 开始网络监听
+        m3u8_task = asyncio.create_task(find_m3u8_via_network(page, M3U8_TIMEOUT))
+
+        print(f"  ▶ 加载播放器页面...")
+        try:
+            await page.goto(player_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            print(f"  ⚠ 加载超时（继续）: {e}")
+
+        # 等待播放器页面 CF 验证（如有）
+        await wait_for_player_cf(page)
+        await asyncio.sleep(2)
+
+        # 尝试点击播放按钮
+        m3u8_url: str | None = None
+        if not m3u8_task.done():
+            print("  ▶ 触发播放...")
+            await try_click_play(page)
+            cf_cleared = await wait_for_player_cf(page)
+            if cf_cleared:
+                await asyncio.sleep(2)
+                m3u8_url = await extract_m3u8_fallback(page)
+                if m3u8_url:
+                    print("  ✓ 从播放器 API 获取 URL（CF 通过后）")
+            if not m3u8_url:
+                await asyncio.sleep(1)
+
+        # 等待网络捕获
+        if not m3u8_url:
+            if m3u8_task.done():
+                try:
+                    m3u8_url = m3u8_task.result()
+                except Exception:
+                    pass
+            else:
+                try:
+                    m3u8_url = await asyncio.wait_for(
+                        asyncio.shield(m3u8_task), timeout=30
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+        # 最终 DOM/JS 搜索
+        if not m3u8_url:
+            m3u8_url = await extract_m3u8_fallback(page)
+
+        if not m3u8_url:
+            screenshot = DOWNLOAD_DIR / "debug_player.png"
+            await page.screenshot(path=str(screenshot), full_page=True)
+            print(f"  截图已保存: {screenshot}")
+
+        await browser.close()
+    return m3u8_url
+
+
+# ─────────────────────────────────────────────
 # 主流程
 # ─────────────────────────────────────────────
 
@@ -1014,6 +1102,25 @@ async def main():
     print("视频下载器 (自动 Cookie 获取版)")
     print("=" * 60)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── PLAYER_URL 快捷路径 ──────────────────────────────────────────────────
+    # 若直接填了播放器 URL，跳过 Cookie 获取和主页面导航，直接加载播放器
+    if PLAYER_URL:
+        print(f"  ▶ 使用直接播放器 URL 模式: {PLAYER_URL[:80]}")
+        m3u8_url = await _extract_from_player_url(PLAYER_URL)
+        if not m3u8_url:
+            print("\n  ✗ 未能从播放器 URL 中提取视频流")
+            sys.exit(1)
+        print(f"\n  ✓ 视频流 URL:\n    {m3u8_url}")
+        output = DOWNLOAD_DIR / "video.mp4"
+        print(f"\n  ▶ 开始下载 → {output}")
+        ok = await download_m3u8(m3u8_url, output)
+        if not ok:
+            print(f"\n  ✗ 下载失败，可手动执行:")
+            print(f'  ffmpeg -i "{m3u8_url}" -c copy output.mp4')
+            sys.exit(1)
+        return
+    # ────────────────────────────────────────────────────────────────────────
 
     # 第一步：自动获取 Cookie
     cookies = await acquire_cookies()
